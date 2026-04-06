@@ -5,70 +5,75 @@ const {
   Events,
   ActionRowBuilder,
   StringSelectMenuBuilder,
+  UserSelectMenuBuilder,
+  RoleSelectMenuBuilder,
   ButtonBuilder,
   ButtonStyle,
   ChannelType,
   PermissionFlagsBits,
-  ModalBuilder,
-  TextInputBuilder,
-  TextInputStyle,
-  UserSelectMenuBuilder,
-  RoleSelectMenuBuilder
+  AttachmentBuilder
 } = require('discord.js');
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers
+  ]
 });
 
 const dadosTickets = new Map();
 
 const CONFIG = {
   canalAberturaId: process.env.CANAL_ABERTURA_ID,
+  cargoLogsTicketsId: process.env.CARGO_LOGS_TICKETS_ID,
+  canalLogsTicketsId: process.env.CANAL_LOGS_TICKETS_ID,
   setores: {
     rh: {
-      nome: 'RH',
+      nome: '🤝 RH',
       descricao: 'Solicitações relacionadas a colaboradores, documentos e processos internos.',
       categoriaId: process.env.CATEGORIA_RH_ID,
       cargoId: process.env.CARGO_RH_ID
     },
     financeiro: {
-      nome: 'Financeiro',
+      nome: '💸 Financeiro',
       descricao: 'Demandas sobre pagamentos, notas fiscais, faturamento e assuntos financeiros.',
       categoriaId: process.env.CATEGORIA_FINANCEIRO_ID,
       cargoId: process.env.CARGO_FINANCEIRO_ID
     },
     noc: {
-      nome: 'NOC',
-      descricao: 'Incidentes de rede, monitoramento, quedas e instabilidades de link.',
+      nome: '🧠 NOC',
+      descricao: 'Incidentes de rede, monitoramento, quedas e instabilidades de link, TI.',
       categoriaId: process.env.CATEGORIA_NOC_ID,
       cargoId: process.env.CARGO_NOC_ID
     },
     estoque: {
-      nome: 'Estoque',
+      nome: '📦 Estoque',
       descricao: 'Controle de equipamentos, materiais, reposição e movimentação de itens.',
       categoriaId: process.env.CATEGORIA_ESTOQUE_ID,
       cargoId: process.env.CARGO_ESTOQUE_ID
     },
     cobranca: {
-      nome: 'Cobrança',
+      nome: '💸 Cobrança',
       descricao: 'Pendências financeiras, negociação, inadimplência e retorno de cobrança.',
       categoriaId: process.env.CATEGORIA_COBRANCA_ID,
       cargoId: process.env.CARGO_COBRANCA_ID
     },
     suporte: {
-      nome: 'Suporte',
+      nome: '🎧 Suporte',
       descricao: 'Problemas técnicos, falhas de acesso, equipamentos e atendimento operacional.',
       categoriaId: process.env.CATEGORIA_SUPORTE_ID,
       cargoId: process.env.CARGO_SUPORTE_ID
     },
     agendamento: {
-      nome: 'Agendamento',
+      nome: '📅 Agendamento',
       descricao: 'Marcação de visitas técnicas, instalações, ativações e remanejamentos.',
       categoriaId: process.env.CATEGORIA_AGENDAMENTO_ID,
       cargoId: process.env.CARGO_AGENDAMENTO_ID
     },
     comercial: {
-      nome: 'Comercial',
+      nome: '💰 Comercial',
       descricao: 'Solicitações sobre vendas, propostas, planos, contratos e relacionamento comercial.',
       categoriaId: process.env.CATEGORIA_COMERCIAL_ID,
       cargoId: process.env.CARGO_COMERCIAL_ID
@@ -89,14 +94,14 @@ function criarMenuSetores() {
     .setCustomId('selecionar_setor')
     .setPlaceholder('Selecione o setor para abrir o ticket')
     .addOptions([
-      { label: 'RH', description: 'Colaboradores, documentos e processos internos.', value: 'rh' },
-      { label: 'Financeiro', description: 'Pagamentos, faturamento e notas fiscais.', value: 'financeiro' },
-      { label: 'NOC', description: 'Rede, monitoramento e incidentes.', value: 'noc' },
-      { label: 'Estoque', description: 'Equipamentos, materiais e controle de itens.', value: 'estoque' },
-      { label: 'Cobrança', description: 'Pendências, negociação e inadimplência.', value: 'cobranca' },
-      { label: 'Suporte', description: 'Falhas técnicas e atendimento operacional.', value: 'suporte' },
-      { label: 'Agendamento', description: 'Visitas, instalações e agenda técnica.', value: 'agendamento' },
-      { label: 'Comercial', description: 'Vendas, propostas, contratos e planos.', value: 'comercial' }
+      { label: '🤝 RH', description: 'Colaboradores, documentos e processos internos.', value: 'rh' },
+      { label: '💸 Financeiro', description: 'Pagamentos, faturamento e notas fiscais.', value: 'financeiro' },
+      { label: '🧠 NOC', description: 'Rede, monitoramento e incidentes.', value: 'noc' },
+      { label: '📦 Estoque', description: 'Equipamentos, materiais e controle de itens.', value: 'estoque' },
+      { label: '💰 Cobrança', description: 'Pendências, negociação e inadimplência.', value: 'cobranca' },
+      { label: '🎧 Suporte', description: 'Falhas técnicas e atendimento operacional.', value: 'suporte' },
+      { label: '📅 Agendamento', description: 'Visitas, instalações e agenda técnica.', value: 'agendamento' },
+      { label: '💰 Comercial', description: 'Vendas, propostas, contratos e planos.', value: 'comercial' }
     ]);
 }
 
@@ -137,6 +142,17 @@ function montarMensagemTicket(ticketId) {
     `**Responsável:** ${dados.responsavelId ? `<@${dados.responsavelId}>` : 'Ainda não assumido'}\n\n` +
     `Descreva sua solicitação com o máximo de detalhes possível para agilizar o atendimento.`
   );
+}
+
+function podeGerenciarTicket(interaction, dados) {
+  if (!interaction.member) return false;
+
+  const membro = interaction.member;
+  const ehAdmin = membro.permissions?.has(PermissionFlagsBits.Administrator);
+  const ehResponsavel = dados.responsavelId === interaction.user.id;
+  const ehCargoDoSetor = membro.roles?.cache?.has(dados.cargoSetorId);
+
+  return ehAdmin || ehResponsavel || ehCargoDoSetor;
 }
 
 async function garantirPainelFixo(guild) {
@@ -211,7 +227,6 @@ client.on(Events.InteractionCreate, async interaction => {
         return;
       }
 
-      const usernameLimpo = normalizarTexto(interaction.user.username);
       const nomeSetorLimpo = normalizarTexto(setor.nome);
 
       const canaisDoSetor = interaction.guild.channels.cache.filter(
@@ -274,7 +289,7 @@ client.on(Events.InteractionCreate, async interaction => {
       });
 
       await canalTicket.send({
-        content: `<@&${setor.cargoId}> novo ticket aberto por ${interaction.user}.`,
+        content: `<@&${setor.cargoId}> novo ticket aberto por ${interaction.user}.`
       });
 
       await canalTicket.send({
@@ -286,6 +301,11 @@ client.on(Events.InteractionCreate, async interaction => {
         content: `Seu ticket foi criado com sucesso: ${canalTicket}`,
         flags: 64
       });
+
+      setTimeout(async () => {
+        await interaction.deleteReply().catch(() => { });
+      }, 10000);
+
       return;
     }
 
@@ -331,8 +351,7 @@ client.on(Events.InteractionCreate, async interaction => {
       dadosTickets.set(ticketId, dados);
 
       const novoNomeCanal =
-        `${normalizarTexto(interaction.user.username)}-${normalizarTexto(dados.setorNome)}-${dados.numeroTicket}`
-          .slice(0, 90);
+        `${normalizarTexto(interaction.user.username)}-${normalizarTexto(dados.setorNome)}-${dados.numeroTicket}`.slice(0, 90);
 
       await interaction.channel.setName(novoNomeCanal).catch(() => { });
 
@@ -355,111 +374,289 @@ client.on(Events.InteractionCreate, async interaction => {
         return;
       }
 
+      if (!podeGerenciarTicket(interaction, dados)) {
+        await interaction.reply({
+          content: 'Somente o responsável, alguém do setor ou um administrador pode adicionar pessoas ou cargos.',
+          flags: 64
+        });
+        return;
+      }
+
+      const botaoPessoa = new ButtonBuilder()
+        .setCustomId(`escolher_add_pessoa_${ticketId}`)
+        .setLabel('Adicionar Pessoa')
+        .setStyle(ButtonStyle.Primary);
+
+      const botaoCargo = new ButtonBuilder()
+        .setCustomId(`escolher_add_cargo_${ticketId}`)
+        .setLabel('Adicionar Cargo')
+        .setStyle(ButtonStyle.Secondary);
+
+      const row = new ActionRowBuilder().addComponents(botaoPessoa, botaoCargo);
+
+      await interaction.reply({
+        content: 'Escolha apenas uma opção:',
+        components: [row],
+        flags: 64
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('escolher_add_pessoa_')) {
+      const ticketId = interaction.customId.replace('escolher_add_pessoa_', '');
+      const dados = dadosTickets.get(ticketId);
+
+      if (!dados) {
+        await interaction.reply({
+          content: 'Dados do ticket não encontrados.',
+          flags: 64
+        });
+        return;
+      }
+
+      if (!podeGerenciarTicket(interaction, dados)) {
+        await interaction.reply({
+          content: 'Você não tem permissão para adicionar pessoas neste ticket.',
+          flags: 64
+        });
+        return;
+      }
+
       const userMenu = new UserSelectMenuBuilder()
         .setCustomId(`selecionar_usuario_${ticketId}`)
-        .setPlaceholder('Selecione uma pessoa para adicionar')
+        .setPlaceholder('Selecione uma pessoa')
         .setMinValues(1)
         .setMaxValues(1);
+
+      const row = new ActionRowBuilder().addComponents(userMenu);
+
+      await interaction.update({
+        content: 'Selecione a pessoa que será adicionada ao ticket:',
+        components: [row]
+      });
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('escolher_add_cargo_')) {
+      const ticketId = interaction.customId.replace('escolher_add_cargo_', '');
+      const dados = dadosTickets.get(ticketId);
+
+      if (!dados) {
+        await interaction.reply({
+          content: 'Dados do ticket não encontrados.',
+          flags: 64
+        });
+        return;
+      }
+
+      if (!podeGerenciarTicket(interaction, dados)) {
+        await interaction.reply({
+          content: 'Você não tem permissão para adicionar cargos neste ticket.',
+          flags: 64
+        });
+        return;
+      }
 
       const roleMenu = new RoleSelectMenuBuilder()
         .setCustomId(`selecionar_cargo_${ticketId}`)
-        .setPlaceholder('Selecione um cargo para adicionar')
+        .setPlaceholder('Selecione um cargo')
         .setMinValues(1)
         .setMaxValues(1);
 
-      const rowUser = new ActionRowBuilder().addComponents(userMenu);
-      const rowRole = new ActionRowBuilder().addComponents(roleMenu);
+      const row = new ActionRowBuilder().addComponents(roleMenu);
 
-      await interaction.reply({
-        content: 'Escolha abaixo uma pessoa ou um cargo para adicionar ao ticket:',
-        components: [rowUser, rowRole],
-        flags: 64
+      await interaction.update({
+        content: 'Selecione o cargo que será adicionado ao ticket:',
+        components: [row]
       });
-
       return;
     }
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_adicionar_')) {
-      const ticketId = interaction.customId.replace('modal_adicionar_', '');
-      const tipo = interaction.fields.getTextInputValue('tipo').trim().toLowerCase();
-      const id = interaction.fields.getTextInputValue('id').trim();
+
+    if (interaction.isUserSelectMenu() && interaction.customId.startsWith('selecionar_usuario_')) {
+      const ticketId = interaction.customId.replace('selecionar_usuario_', '');
+      const dados = dadosTickets.get(ticketId);
+      const userId = interaction.values[0];
+
+      await interaction.deferReply({ flags: 64 });
+
+      if (!dados) {
+        await interaction.editReply({
+          content: 'Dados do ticket não encontrados.'
+        });
+        return;
+      }
 
       if (!interaction.channel) {
-        await interaction.reply({
-          content: 'Canal do ticket não encontrado.',
-          flags: 64
+        await interaction.editReply({
+          content: 'Canal do ticket não encontrado.'
         });
         return;
       }
 
-      if (tipo !== 'pessoa' && tipo !== 'cargo') {
-        await interaction.reply({
-          content: 'Tipo inválido. Digite exatamente: pessoa ou cargo.',
-          flags: 64
+      if (!podeGerenciarTicket(interaction, dados)) {
+        await interaction.editReply({
+          content: 'Você não tem permissão para adicionar pessoas neste ticket.'
         });
         return;
       }
 
-      if (tipo === 'pessoa') {
-        await interaction.channel.permissionOverwrites.edit(id, {
-          ViewChannel: true,
-          SendMessages: true,
-          ReadMessageHistory: true
-        }).catch(async () => {
-          await interaction.reply({
-            content: 'Não consegui adicionar essa pessoa. Verifique se o ID está correto.',
-            flags: 64
-          });
-        });
+      await interaction.channel.permissionOverwrites.edit(userId, {
+        ViewChannel: true,
+        SendMessages: true,
+        ReadMessageHistory: true
+      });
 
-        if (!interaction.replied) {
-          await interaction.reply({
-            content: `Pessoa <@${id}> adicionada ao ticket com sucesso.`,
-            flags: 64
-          });
-        }
+      await interaction.editReply({
+        content: `Pessoa <@${userId}> adicionada ao ticket com sucesso.`
+      });
+      return;
+    }
+
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('selecionar_cargo_')) {
+      const ticketId = interaction.customId.replace('selecionar_cargo_', '');
+      const dados = dadosTickets.get(ticketId);
+      const roleId = interaction.values[0];
+
+      await interaction.deferReply({ flags: 64 });
+
+      if (!dados) {
+        await interaction.editReply({
+          content: 'Dados do ticket não encontrados.'
+        });
         return;
       }
 
-      if (tipo === 'cargo') {
-        await interaction.channel.permissionOverwrites.edit(id, {
-          ViewChannel: true,
-          SendMessages: true,
-          ReadMessageHistory: true
-        }).catch(async () => {
-          await interaction.reply({
-            content: 'Não consegui adicionar esse cargo. Verifique se o ID está correto.',
-            flags: 64
-          });
+      if (!interaction.channel) {
+        await interaction.editReply({
+          content: 'Canal do ticket não encontrado.'
         });
-
-        if (!interaction.replied) {
-          await interaction.reply({
-            content: `Cargo <@&${id}> adicionado ao ticket com sucesso.`,
-            flags: 64
-          });
-        }
         return;
       }
+
+      if (!podeGerenciarTicket(interaction, dados)) {
+        await interaction.editReply({
+          content: 'Você não tem permissão para adicionar cargos neste ticket.'
+        });
+        return;
+      }
+
+      await interaction.channel.permissionOverwrites.edit(roleId, {
+        ViewChannel: true,
+        SendMessages: true,
+        ReadMessageHistory: true
+      });
+
+      await interaction.editReply({
+        content: `Cargo <@&${roleId}> adicionado ao ticket com sucesso.`
+      });
+      return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith('fechar_ticket_')) {
       const ticketId = interaction.customId.replace('fechar_ticket_', '');
+      const dados = dadosTickets.get(ticketId);
+
+      if (interaction.user.id !== dados.solicitanteId) {
+        await interaction.reply({
+          content: 'Apenas quem abriu o ticket pode fechá-lo.',
+          flags: 64
+        });
+        return;
+      }
 
       await interaction.reply({
-        content: 'Fechando ticket em 3 segundos...',
+        content: 'Gerando transcript e fechando ticket...',
         flags: 64
       });
 
-      setTimeout(async () => {
-        try {
-          dadosTickets.delete(ticketId);
-          if (interaction.channel) {
-            await interaction.channel.delete('Ticket fechado manualmente.');
-          }
-        } catch (error) {
-          console.error('Erro ao fechar ticket:', error);
+      try {
+        let mensagens = [];
+        let ultimaId;
+
+        while (true) {
+          const options = { limit: 100 };
+          if (ultimaId) options.before = ultimaId;
+
+          const msgs = await interaction.channel.messages.fetch(options);
+          if (!msgs.size) break;
+
+          mensagens.push(...msgs.values());
+          ultimaId = msgs.last().id;
+
+          if (msgs.size < 100) break;
         }
-      }, 3000);
+
+        mensagens = mensagens.reverse();
+
+        let transcript = '';
+        transcript += `Transcript do Ticket\n`;
+        transcript += `Canal: #${interaction.channel.name}\n`;
+        transcript += `Solicitante: ${dados.solicitanteTag}\n`;
+        transcript += `Setor: ${dados.setorNome}\n`;
+        transcript += `Fechado por: ${interaction.user.tag}\n`;
+        transcript += `Gerado em: ${new Date().toLocaleString('pt-BR')}\n\n`;
+
+        for (const msg of mensagens) {
+          transcript += `[${msg.createdAt.toLocaleString('pt-BR')}] ${msg.author.tag}\n`;
+          transcript += `${msg.content || '[sem texto]'}\n`;
+
+          if (msg.attachments.size > 0) {
+            for (const anexo of msg.attachments.values()) {
+              transcript += `Anexo: ${anexo.url}\n`;
+            }
+          }
+
+          transcript += `\n`;
+        }
+
+        const buffer = Buffer.from(transcript, 'utf-8');
+
+        const arquivoUsuario = new AttachmentBuilder(Buffer.from(buffer), {
+          name: `transcript-${interaction.channel.name}.txt`
+        });
+
+        const arquivoLogs = new AttachmentBuilder(Buffer.from(buffer), {
+          name: `transcript-${interaction.channel.name}.txt`
+        });
+
+        const user = await client.users.fetch(dados.solicitanteId).catch(() => null);
+
+        if (user) {
+          await user.send({
+            content: 'Aqui está o transcript do seu ticket.',
+            files: [arquivoUsuario]
+          }).catch(() => { });
+        }
+
+        const canalLogs = await interaction.guild.channels.fetch(CONFIG.canalLogsTicketsId).catch(() => null);
+
+        if (canalLogs && canalLogs.isTextBased()) {
+          await canalLogs.send({
+            content:
+              `Ticket fechado\n` +
+              `Solicitante: <@${dados.solicitanteId}>\n` +
+              `Setor: ${dados.setorNome}\n` +
+              `Fechado por: <@${interaction.user.id}>`,
+            files: [arquivoLogs]
+          }).catch(error => console.error('Erro ao enviar para o canal de logs:', error));
+        }
+
+        dadosTickets.delete(ticketId);
+
+        setTimeout(async () => {
+          if (interaction.channel) {
+            await interaction.channel.delete('Ticket fechado com transcript.');
+          }
+        }, 3000);
+
+      } catch (error) {
+        console.error('Erro ao gerar transcript:', error);
+
+        await interaction.editReply({
+          content: 'Erro ao gerar o transcript.'
+        }).catch(() => { });
+      }
+
       return;
     }
   } catch (error) {
@@ -469,6 +666,13 @@ client.on(Events.InteractionCreate, async interaction => {
       await interaction.reply({
         content: 'Ocorreu um erro ao processar sua solicitação.',
         flags: 64
+      }).catch(() => { });
+      return;
+    }
+
+    if (interaction.deferred) {
+      await interaction.editReply({
+        content: 'Ocorreu um erro ao processar sua solicitação.'
       }).catch(() => { });
     }
   }
