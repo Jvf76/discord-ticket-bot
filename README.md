@@ -27,7 +27,7 @@ Bot de sistema de tickets para Discord com gerenciamento de usuários e cargos, 
 Clone o repositório:
 
 ```bash
-git clone https://github.com/seuuser/discord-ticket-bot.git
+git clone https://github.com/Jvf76/discord-ticket-bot.git
 ```
 
 Entre na pasta:
