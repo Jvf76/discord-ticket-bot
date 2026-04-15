@@ -1,8 +1,17 @@
 require('dotenv').config();
 const {
-  Client, GatewayIntentBits, Events, ActionRowBuilder,
-  StringSelectMenuBuilder, UserSelectMenuBuilder, RoleSelectMenuBuilder,
-  ButtonBuilder, ButtonStyle, ChannelType, PermissionFlagsBits, AttachmentBuilder
+  Client,
+  GatewayIntentBits,
+  Events,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+  UserSelectMenuBuilder,
+  RoleSelectMenuBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ChannelType,
+  PermissionFlagsBits,
+  AttachmentBuilder
 } = require('discord.js');
 
 const client = new Client({
