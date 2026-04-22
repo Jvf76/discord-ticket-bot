@@ -6,6 +6,10 @@
   "scripts": {
     "start": "node index.js",
     "deploy": "node deploy-commands.js",
+    "git:commit:hiago": "bash scripts/git-commit-as.sh hiago",
+    "git:commit:joao": "bash scripts/git-commit-as.sh joao",
+    "git:push:hiago": "bash scripts/git-push-as.sh hiago",
+    "git:push:joao": "bash scripts/git-push-as.sh joao",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

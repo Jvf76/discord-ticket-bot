@@ -1,0 +1,7 @@
+PROFILE_HIAGO_NAME="Hiago"
+PROFILE_HIAGO_EMAIL="hiago@exemplo.com"
+PROFILE_HIAGO_SSH_KEY="/home/agenda/.ssh/id_ed25519_hiago"
+
+PROFILE_JOAO_NAME="Joao Vitor"
+PROFILE_JOAO_EMAIL="joao@exemplo.com"
+PROFILE_JOAO_SSH_KEY="/home/agenda/.ssh/id_ed25519_joao"

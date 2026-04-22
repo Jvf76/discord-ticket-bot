@@ -1,4 +1,7 @@
 require('dotenv').config();
+const fs = require('node:fs');
+const path = require('node:path');
+const { DatabaseSync } = require('node:sqlite');
 const { readEnv, requireEnv } = require('./env');
 const {
   diagnoseDiscordConnection,
@@ -26,6 +29,8 @@ const client = new Client({
 });
 
 const dadosTickets = new Map();
+const RELATORIOS_PATH = path.join(__dirname, 'data', 'relatorios.json');
+const DB_PATH = path.resolve(__dirname, readEnv('DATABASE_PATH') || path.join('data', 'tickets.db'));
 const env = requireEnv([
   'TOKEN',
   'CANAL_ABERTURA_ID',
@@ -51,6 +56,7 @@ const env = requireEnv([
 const CONFIG = {
   canalAberturaId:    env.CANAL_ABERTURA_ID,
   canalLogsTicketsId: env.CANAL_LOGS_TICKETS_ID,
+  canalRelatoriosTicketsId: readEnv('CANAL_RELATORIOS_TICKETS_ID'),
   setores: {
     rh:          { nome: '🤝 RH',          descricao: 'Solicitações relacionadas a colaboradores, documentos e processos internos.',          categoriaId: env.CATEGORIA_RH_ID,          cargoId: env.CARGO_RH_ID,          canalFechadosId: readEnv('CANAL_FECHADOS_RH_ID') },
     financeiro:  { nome: '💸 Financeiro',  descricao: 'Demandas sobre pagamentos, notas fiscais, faturamento e assuntos financeiros.',       categoriaId: env.CATEGORIA_FINANCEIRO_ID,  cargoId: env.CARGO_FINANCEIRO_ID,  canalFechadosId: readEnv('CANAL_FECHADOS_FINANCEIRO_ID') },
@@ -70,6 +76,235 @@ const esc       = str => String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').
 const extOf     = url => url.split('?')[0].split('.').pop().toLowerCase();
 const eImagem   = url => ['png','jpg','jpeg','gif','webp','svg'].includes(extOf(url));
 const eVideo    = url => ['mp4','webm','mov'].includes(extOf(url));
+const RELATORIO_SEMANAL_HORA = Number(readEnv('RELATORIO_SEMANAL_HORA') || 8);
+
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+const db = new DatabaseSync(DB_PATH);
+
+function iniciarBanco() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ticket_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ticket_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      user_tag TEXT,
+      username TEXT,
+      setor_key TEXT NOT NULL,
+      setor_nome TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(ticket_id, event_type)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ticket_events_type ON ticket_events(event_type);
+    CREATE INDEX IF NOT EXISTS idx_ticket_events_user ON ticket_events(user_id);
+    CREATE INDEX IF NOT EXISTS idx_ticket_events_setor ON ticket_events(setor_key);
+
+    CREATE TABLE IF NOT EXISTS bot_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+}
+
+function lerEstadoBot(key) {
+  return db.prepare('SELECT value FROM bot_state WHERE key = ?').get(key)?.value;
+}
+
+function salvarEstadoBot(key, value) {
+  db.prepare(`
+    INSERT INTO bot_state (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET
+      value = excluded.value,
+      updated_at = excluded.updated_at
+  `).run(key, value, new Date().toISOString());
+}
+
+function inserirEventoTicket({ ticketId, eventType, userId, userTag, username, setorKey, setorNome, createdAt }) {
+  db.prepare(`
+    INSERT OR IGNORE INTO ticket_events
+      (ticket_id, event_type, user_id, user_tag, username, setor_key, setor_nome, created_at)
+    VALUES
+      (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(ticketId, eventType, userId, userTag, username, setorKey || 'sem_setor', setorNome || 'Sem setor', createdAt || new Date().toISOString());
+}
+
+function repetir(total, fn) {
+  const n = Number(total) || 0;
+  for (let i = 0; i < n; i++) fn(i);
+}
+
+function migrarRelatoriosJson() {
+  if (!fs.existsSync(RELATORIOS_PATH)) return;
+
+  const totalEventos = db.prepare('SELECT COUNT(*) AS total FROM ticket_events').get()?.total || 0;
+  if (totalEventos > 0) return;
+
+  try {
+    const dados = JSON.parse(fs.readFileSync(RELATORIOS_PATH, 'utf8'));
+
+    const abertosPorUsuario = Object.values(dados.abertosPorUsuario || {});
+    const assumidosPorUsuario = Object.values(dados.assumidosPorUsuario || {});
+
+    for (const item of abertosPorUsuario) {
+      const setores = Object.entries(item.setores || {});
+      if (!setores.length) setores.push(['sem_setor', item.total]);
+      for (const [setorKey, totalSetor] of setores) {
+        repetir(totalSetor, i => inserirEventoTicket({
+          ticketId: `json-aberto-usuario-${item.userId}-${setorKey}-${i}`,
+          eventType: 'aberto',
+          userId: item.userId,
+          userTag: item.tag,
+          username: item.username,
+          setorKey,
+          setorNome: dados.abertosPorSetor?.[setorKey]?.setorNome || 'Importado do JSON',
+          createdAt: item.ultimoAbertoEm || dados.atualizadoEm
+        }));
+      }
+    }
+
+    for (const item of assumidosPorUsuario) {
+      const setores = Object.entries(item.setores || {});
+      if (!setores.length) setores.push(['sem_setor', item.total]);
+      for (const [setorKey, totalSetor] of setores) {
+        repetir(totalSetor, i => inserirEventoTicket({
+          ticketId: `json-assumido-usuario-${item.userId}-${setorKey}-${i}`,
+          eventType: 'assumido',
+          userId: item.userId,
+          userTag: item.tag,
+          username: item.username,
+          setorKey,
+          setorNome: dados.respondidosPorSetor?.[setorKey]?.setorNome || 'Importado do JSON',
+          createdAt: item.ultimoAssumidoEm || dados.atualizadoEm
+        }));
+      }
+    }
+
+    if (!abertosPorUsuario.length) {
+      for (const item of Object.values(dados.abertosPorSetor || {})) {
+        repetir(item.total, i => inserirEventoTicket({
+          ticketId: `json-aberto-setor-${item.setorKey}-${i}`,
+          eventType: 'aberto',
+          userId: 'importado-json',
+          userTag: 'Importado do JSON',
+          username: 'Importado do JSON',
+          setorKey: item.setorKey,
+          setorNome: item.setorNome,
+          createdAt: dados.atualizadoEm
+        }));
+      }
+    }
+
+    if (!assumidosPorUsuario.length) {
+      for (const item of Object.values(dados.respondidosPorSetor || {})) {
+        repetir(item.total, i => inserirEventoTicket({
+          ticketId: `json-assumido-setor-${item.setorKey}-${i}`,
+          eventType: 'assumido',
+          userId: 'importado-json',
+          userTag: 'Importado do JSON',
+          username: 'Importado do JSON',
+          setorKey: item.setorKey,
+          setorNome: item.setorNome,
+          createdAt: dados.atualizadoEm
+        }));
+      }
+    }
+
+    console.log('[relatorios] Dados antigos do JSON importados para o SQLite.');
+  } catch (error) {
+    console.error(`[relatorios] Falha ao migrar JSON para SQLite: ${formatError(error)}`);
+  }
+}
+
+iniciarBanco();
+migrarRelatoriosJson();
+
+function registrarTicketAberto(interaction, dados) {
+  inserirEventoTicket({
+    ticketId: dados.ticketId || interaction.channelId || `aberto-${Date.now()}`,
+    eventType: 'aberto',
+    userId: interaction.user.id,
+    userTag: interaction.user.tag,
+    username: interaction.user.username,
+    setorKey: dados.setorKey,
+    setorNome: dados.setorNome
+  });
+}
+
+function registrarTicketAssumido(interaction, dados) {
+  inserirEventoTicket({
+    ticketId: dados.ticketId || interaction.channelId || `assumido-${Date.now()}`,
+    eventType: 'assumido',
+    userId: interaction.user.id,
+    userTag: interaction.user.tag,
+    username: interaction.user.username,
+    setorKey: dados.setorKey,
+    setorNome: dados.setorNome
+  });
+}
+
+function montarRanking(sql, params, formatarLinha) {
+  const ranking = db.prepare(sql).all(...params);
+  if (!ranking.length) return 'Sem registros ainda.';
+
+  return ranking.map((item, index) => {
+    const total = Number(item.total);
+    const plural = total === 1 ? 'ticket' : 'tickets';
+    return formatarLinha(item, index, total, plural);
+  }).join('\n');
+}
+
+function montarRelatorioTickets() {
+  const ultimoEvento = db.prepare('SELECT MAX(created_at) AS atualizadoEm FROM ticket_events').get();
+  const atualizado = ultimoEvento?.atualizadoEm
+    ? new Date(ultimoEvento.atualizadoEm).toLocaleString('pt-BR')
+    : 'sem data';
+
+  const abertosPorSetor = montarRanking(
+    `SELECT setor_key AS setorKey, setor_nome AS setorNome, COUNT(*) AS total
+       FROM ticket_events
+      WHERE event_type = ?
+      GROUP BY setor_key, setor_nome
+      ORDER BY total DESC
+      LIMIT 5`,
+    ['aberto'],
+    (item, index, total, plural) => `${index + 1}. ${item.setorNome} - **${total}** ${plural}`
+  );
+  const respondidosPorSetor = montarRanking(
+    `SELECT setor_key AS setorKey, setor_nome AS setorNome, COUNT(*) AS total
+       FROM ticket_events
+      WHERE event_type = ?
+      GROUP BY setor_key, setor_nome
+      ORDER BY total DESC
+      LIMIT 5`,
+    ['assumido'],
+    (item, index, total, plural) => `${index + 1}. ${item.setorNome} - **${total}** ${plural}`
+  );
+  const assumidosPorUsuario = montarRanking(
+    `SELECT user_id AS userId, COALESCE(MAX(user_tag), MAX(username), user_id) AS nome, COUNT(*) AS total
+       FROM ticket_events
+      WHERE event_type = ? AND user_id != 'importado-json'
+      GROUP BY user_id
+      ORDER BY total DESC
+      LIMIT 5`,
+    ['assumido'],
+    (item, index, total, plural) => `${index + 1}. <@${item.userId}> - **${total}** ${plural}`
+  );
+  const abertosPorUsuario = montarRanking(
+    `SELECT user_id AS userId, COALESCE(MAX(user_tag), MAX(username), user_id) AS nome, COUNT(*) AS total
+       FROM ticket_events
+      WHERE event_type = ? AND user_id != 'importado-json'
+      GROUP BY user_id
+      ORDER BY total DESC
+      LIMIT 5`,
+    ['aberto'],
+    (item, index, total, plural) => `${index + 1}. <@${item.userId}> - **${total}** ${plural}`
+  );
+
+  return `# 📊 Relatório de tickets\n\n**Setor que mais abriu tickets**\n${abertosPorSetor}\n\n**Setor que mais respondeu tickets**\n${respondidosPorSetor}\n\n**Quem mais assumiu tickets**\n${assumidosPorUsuario}\n\n**Quem mais abriu tickets**\n${abertosPorUsuario}\n\nAtualizado em: ${atualizado}`;
+}
 
 const MIME = {
   png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif', webp:'image/webp', svg:'image/svg+xml',
@@ -325,8 +560,11 @@ function montarMensagemTicket(ticketId) {
   return `# 🎫 Ticket Aberto\n\n**Solicitante:** <@${d.solicitanteId}>\n**Setor:** ${d.setorNome}\n**Descrição do setor:** ${d.setorDescricao}\n**Cargo responsável:** <@&${d.cargoSetorId}>\n**Status:** ${d.responsavelId ? 'Em atendimento' : 'Aguardando atendimento'}\n**Responsável:** ${d.responsavelId ? `<@${d.responsavelId}>` : 'Ainda não assumido'}\n\nDescreva sua solicitação com o máximo de detalhes possível para agilizar o atendimento.`;
 }
 
-const podeGerenciar = ({ member, user }, d) =>
-  Boolean(member && (member.permissions?.has(PermissionFlagsBits.Administrator) || d.responsavelId === user.id || member.roles?.cache?.has(d.cargoSetorId)));
+const podeAdicionarAoTicket = ({ user }, d) =>
+  Boolean(user && (d.solicitanteId === user.id || d.responsavelId === user.id));
+
+const podeFecharTicket = ({ user }, d) =>
+  Boolean(user && (d.solicitanteId === user.id || d.responsavelId === user.id));
 
 async function garantirPainelFixo(guild) {
   const canal = await guild.channels.fetch(CONFIG.canalAberturaId).catch(() => null);
@@ -371,6 +609,76 @@ async function enviarTranscriptPorDm(userId, payload) {
   return true;
 }
 
+async function publicarRelatorioTickets(interaction) {
+  const relatorio = montarRelatorioTickets();
+  if (!CONFIG.canalRelatoriosTicketsId) {
+    return interaction.reply({ content: relatorio, flags: 64 });
+  }
+
+  const canal = await interaction.guild.channels.fetch(CONFIG.canalRelatoriosTicketsId).catch(() => null);
+  if (!canal?.isTextBased()) {
+    return interaction.reply(ephemeral('Canal de relatórios não encontrado ou não é um canal de texto.'));
+  }
+
+  await canal.send({ content: relatorio });
+  return interaction.reply(ephemeral(`Relatório enviado em <#${CONFIG.canalRelatoriosTicketsId}>.`));
+}
+
+function dataHoraSaoPaulo(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    weekday: 'short',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    hour12: false
+  }).formatToParts(date);
+  const get = type => parts.find(part => part.type === type)?.value;
+  return {
+    dateKey: `${get('year')}-${get('month')}-${get('day')}`,
+    weekday: get('weekday'),
+    hour: Number(get('hour'))
+  };
+}
+
+async function publicarRelatorioSemanal() {
+  if (!CONFIG.canalRelatoriosTicketsId) return false;
+
+  const canal = await client.channels.fetch(CONFIG.canalRelatoriosTicketsId).catch(() => null);
+  if (!canal?.isTextBased()) {
+    console.error('[relatorios] Canal de relatórios não encontrado ou não é um canal de texto.');
+    return false;
+  }
+
+  await canal.send({ content: montarRelatorioTickets() });
+  return true;
+}
+
+async function verificarRelatorioSemanal() {
+  const agora = dataHoraSaoPaulo();
+  if (agora.weekday !== 'Mon' || agora.hour < RELATORIO_SEMANAL_HORA) return;
+  if (lerEstadoBot('ultimo_relatorio_semanal') === agora.dateKey) return;
+
+  const publicado = await publicarRelatorioSemanal();
+  if (publicado) {
+    salvarEstadoBot('ultimo_relatorio_semanal', agora.dateKey);
+    console.log(`[relatorios] Relatorio semanal publicado em ${agora.dateKey}.`);
+  }
+}
+
+function iniciarAgendamentoRelatorioSemanal() {
+  if (!CONFIG.canalRelatoriosTicketsId) {
+    console.warn('[relatorios] CANAL_RELATORIOS_TICKETS_ID nao configurado; relatorio semanal automatico desativado.');
+    return;
+  }
+
+  verificarRelatorioSemanal().catch(error => console.error(`[relatorios] Falha no agendamento semanal: ${formatError(error)}`));
+  setInterval(() => {
+    verificarRelatorioSemanal().catch(error => console.error(`[relatorios] Falha no agendamento semanal: ${formatError(error)}`));
+  }, 60 * 60 * 1000);
+}
+
 function logDiscordError(event, error) {
   console.error(`[discord:${event}] ${formatError(error)}`);
 }
@@ -391,11 +699,20 @@ client.on(Events.ShardResume, (shardId, replayedEvents) => {
 client.once(Events.ClientReady, async () => {
   console.log(`Bot online como ${client.user.tag}`);
   for (const guild of client.guilds.cache.values()) await garantirPainelFixo(guild);
+  iniciarAgendamentoRelatorioSemanal();
 });
 
 client.on(Events.InteractionCreate, async interaction => {
   try {
     const { customId } = interaction;
+
+    if (interaction.isChatInputCommand() && interaction.commandName === 'relatorio') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+        return interaction.reply(ephemeral('Apenas administradores podem consultar relatórios.'));
+      }
+
+      return publicarRelatorioTickets(interaction);
+    }
 
     if (interaction.isStringSelectMenu() && customId === 'selecionar_setor') {
       if (interaction.channelId !== CONFIG.canalAberturaId)
@@ -423,13 +740,20 @@ client.on(Events.InteractionCreate, async interaction => {
 
       const cargoObj = await interaction.guild.roles.fetch(setor.cargoId).catch(() => null);
 
-      dadosTickets.set(canalTicket.id, {
+      const dadosTicket = {
+        ticketId: canalTicket.id,
         setorKey: interaction.values[0],
         solicitanteId: interaction.user.id, solicitanteTag: interaction.user.tag,
         setorNome: setor.nome, setorDescricao: setor.descricao,
         cargoSetorId: setor.cargoId, cargoSetorNome: cargoObj?.name || 'Desconhecido',
         responsavelId: null, responsavelTag: null, numeroTicket, canalNome: nomeCanal
-      });
+      };
+      dadosTickets.set(canalTicket.id, dadosTicket);
+      try {
+        registrarTicketAberto(interaction, dadosTicket);
+      } catch (error) {
+        console.error(`[relatorios] Falha ao registrar ticket aberto: ${formatError(error)}`);
+      }
 
       await canalTicket.send({ content: `<@&${setor.cargoId}> novo ticket aberto por ${interaction.user}.` });
       await canalTicket.send({ content: montarMensagemTicket(canalTicket.id), components: [criarBotoesTicket(canalTicket.id)] });
@@ -450,6 +774,11 @@ client.on(Events.InteractionCreate, async interaction => {
       dados.responsavelId  = interaction.user.id;
       dados.responsavelTag = interaction.user.username;
       dadosTickets.set(ticketId, dados);
+      try {
+        registrarTicketAssumido(interaction, dados);
+      } catch (error) {
+        console.error(`[relatorios] Falha ao registrar ticket assumido: ${formatError(error)}`);
+      }
       await interaction.channel.setName(`${normalize(interaction.user.username)}-${normalize(dados.setorNome)}-${dados.numeroTicket}`.slice(0, 90)).catch(() => {});
       return interaction.update({ content: montarMensagemTicket(ticketId), components: [criarBotoesTicket(ticketId)] });
     }
@@ -458,7 +787,7 @@ client.on(Events.InteractionCreate, async interaction => {
       const ticketId = customId.replace('adicionar_ticket_', '');
       const dados    = dadosTickets.get(ticketId);
       if (!dados) return interaction.reply(ephemeral('Dados do ticket não encontrados.'));
-      if (!podeGerenciar(interaction, dados)) return interaction.reply(ephemeral('Somente o responsável, alguém do setor ou um administrador pode adicionar pessoas ou cargos.'));
+      if (!podeAdicionarAoTicket(interaction, dados)) return interaction.reply(ephemeral('Somente quem abriu o ticket ou quem assumiu o atendimento pode adicionar pessoas ou cargos.'));
       return interaction.reply({
         content: 'Escolha apenas uma opção:',
         components: [row(
@@ -471,14 +800,14 @@ client.on(Events.InteractionCreate, async interaction => {
     if (interaction.isButton() && customId.startsWith('escolher_add_pessoa_')) {
       const ticketId = customId.replace('escolher_add_pessoa_', '');
       const dados    = dadosTickets.get(ticketId);
-      if (!dados || !podeGerenciar(interaction, dados)) return interaction.reply(ephemeral('Você não tem permissão para adicionar pessoas neste ticket.'));
+      if (!dados || !podeAdicionarAoTicket(interaction, dados)) return interaction.reply(ephemeral('Você não tem permissão para adicionar pessoas neste ticket.'));
       return interaction.update({ content: 'Selecione a pessoa:', components: [row(new UserSelectMenuBuilder().setCustomId(`selecionar_usuario_${ticketId}`).setPlaceholder('Selecione uma pessoa').setMinValues(1).setMaxValues(1))] });
     }
 
     if (interaction.isButton() && customId.startsWith('escolher_add_cargo_')) {
       const ticketId = customId.replace('escolher_add_cargo_', '');
       const dados    = dadosTickets.get(ticketId);
-      if (!dados || !podeGerenciar(interaction, dados)) return interaction.reply(ephemeral('Você não tem permissão para adicionar cargos neste ticket.'));
+      if (!dados || !podeAdicionarAoTicket(interaction, dados)) return interaction.reply(ephemeral('Você não tem permissão para adicionar cargos neste ticket.'));
       return interaction.update({ content: 'Selecione o cargo:', components: [row(new RoleSelectMenuBuilder().setCustomId(`selecionar_cargo_${ticketId}`).setPlaceholder('Selecione um cargo').setMinValues(1).setMaxValues(1))] });
     }
 
@@ -491,7 +820,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
       await interaction.deferReply({ flags: 64 });
       if (!dados || !interaction.channel) return interaction.editReply({ content: 'Dados ou canal do ticket não encontrados.' });
-      if (!podeGerenciar(interaction, dados)) return interaction.editReply({ content: `Sem permissão para adicionar ${isUser ? 'pessoas' : 'cargos'}.` });
+      if (!podeAdicionarAoTicket(interaction, dados)) return interaction.editReply({ content: `Sem permissão para adicionar ${isUser ? 'pessoas' : 'cargos'}.` });
 
       await interaction.channel.permissionOverwrites.edit(targetId, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true });
       return interaction.editReply({ content: `${isUser ? `Pessoa <@${targetId}>` : `Cargo <@&${targetId}>`} adicionado com sucesso.` });
@@ -500,7 +829,7 @@ client.on(Events.InteractionCreate, async interaction => {
     if (interaction.isButton() && customId.startsWith('fechar_ticket_')) {
       const ticketId = customId.replace('fechar_ticket_', '');
       const dados    = dadosTickets.get(ticketId);
-      if (interaction.user.id !== dados?.solicitanteId) return interaction.reply(ephemeral('Apenas quem abriu o ticket pode fechá-lo.'));
+      if (!podeFecharTicket(interaction, dados)) return interaction.reply(ephemeral('Apenas quem abriu o ticket ou quem assumiu o atendimento pode fechá-lo.'));
 
       await interaction.reply(ephemeral('Gerando transcript e fechando ticket...'));
 

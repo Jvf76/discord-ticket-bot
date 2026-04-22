@@ -1,3 +1,5 @@
 node_modules/
 .env
 .codex
+.git-profiles.local
+data/
