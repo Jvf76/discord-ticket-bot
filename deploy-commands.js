@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { PermissionFlagsBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 const { requireEnv } = require('./env');
 const {
   diagnoseDiscordConnection,
@@ -11,11 +11,6 @@ const commands = [
   new SlashCommandBuilder()
     .setName('painel')
     .setDescription('Envia o painel de abertura de tickets')
-    .toJSON(),
-  new SlashCommandBuilder()
-    .setName('relatorio')
-    .setDescription('Mostra o ranking de quem mais assumiu tickets')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .toJSON()
 ];
 
@@ -39,7 +34,7 @@ const rest = new REST({ version: '10' }).setToken(env.TOKEN);
       { body: commands }
     );
 
-    console.log('Comando /painel registrado com sucesso!');
+    console.log('Comandos registrados com sucesso!');
   } catch (error) {
     if (isRetryableConnectionError(error)) {
       console.error(`[discord:deploy] Falha de conectividade: ${formatError(error)}`);

@@ -7,14 +7,16 @@ Bot de sistema de tickets para Discord com transcript automático em HTML, geren
 ## 🚀 Funcionalidades
 
 - **📩 Criação de tickets por setor** — painel com menu de seleção para RH, Financeiro, NOC, Estoque, Cobrança, Suporte, Agendamento e Comercial
+- **🏪 Abertura comercial separada** — canal proprio para o comercial abrir ticket ao suporte com ID do cliente, relato, atendente, telefone e motivo obrigatório
 - **🔒 Canais privados** — cada ticket abre um canal exclusivo visível apenas ao solicitante e ao setor responsável
 - **🤝 Assumir ticket** — membros do setor podem assumir o atendimento, registrando o responsável
 - **👥 Adicionar pessoas e cargos** — apenas o solicitante ou o responsável que assumiu pode incluir outros usuários ou cargos ao ticket
 - **📄 Transcript automático em HTML** — o solicitante ou o responsável que assumiu pode fechar o ticket, gerando um arquivo `.html` estilizado com tema Discord contendo todo o histórico
+- **🔗 Link direto do transcript** — opcionalmente o bot publica o HTML em uma pasta pública e envia um link de acesso no domínio configurado, sem precisar baixar anexo
 - **📊 Relatório de atendimento** — comando `/relatorio` para administradores verem rankings por setor, solicitante e responsável
 - **🖼️ Imagens e anexos embutidos** — fotos, PDFs, vídeos e arquivos são baixados e incorporados no transcript em base64, funcionando mesmo offline
 - **🔍 Nomes reais nas menções** — menções de usuários, cargos e canais são resolvidas para os nomes reais no transcript
-- **📬 Envio automático** — o transcript é enviado por DM ao solicitante, ao responsável que assumiu o ticket e registrado nos canais de logs/fechados
+- **📬 Envio automático** — o transcript é enviado por DM ao solicitante, por DM ao responsável que assumiu e ao canal de fechados do setor correspondente
 
 ---
 
@@ -63,14 +65,21 @@ TOKEN=seu_token_aqui
 CLIENT_ID=id_da_aplicacao_do_bot
 
 CANAL_ABERTURA_ID=id_do_canal_onde_o_painel_fica
-CANAL_LOGS_TICKETS_ID=id_do_canal_de_logs
+CANAL_ABERTURA_TICKET_COMERCIAL=id_do_canal_comercial_para_abrir_ticket_ao_suporte
 CANAL_RELATORIOS_TICKETS_ID=id_do_canal_de_relatorios
+CANAL_RANKING_TICKETS_ID=id_do_canal_de_rankings
 
 # Opcional: caminho do banco SQLite local
 DATABASE_PATH=data/tickets.db
 
-# Opcional: hora em Sao Paulo para publicar o relatório semanal na segunda-feira
-RELATORIO_SEMANAL_HORA=8
+# Opcional: publicar transcripts em um dominio/pasta publica
+TRANSCRIPT_BASE_URL=
+TRANSCRIPT_PUBLIC_DIR=data/public/transcripts
+TRANSCRIPT_ROUTE_PREFIX=/transcripts
+TRANSCRIPT_HTTP_PORT=
+
+# Opcional: hora em Sao Paulo para publicar o relatório diario
+RELATORIO_DIARIO_HORA=8
 
 # Opcional: canais de tickets fechados por setor
 CANAL_FECHADOS_RH_ID=
@@ -112,7 +121,7 @@ node deploy-commands.js
 node index.js
 ```
 
-O deploy registra os comandos `/painel` e `/relatorio`. O bot iniciará e publicará automaticamente o painel de abertura de tickets no canal configurado em `CANAL_ABERTURA_ID`.
+O deploy registra os comandos `/painel` e `/relatorio`. O bot iniciará e publicará automaticamente o painel de abertura de tickets no canal configurado em `CANAL_ABERTURA_ID`. Se `CANAL_ABERTURA_TICKET_COMERCIAL` estiver configurado, ele tambem publica um painel separado para o comercial abrir tickets diretamente para o suporte.
 
 Também é possível usar os scripts:
 
@@ -121,9 +130,9 @@ npm run deploy
 npm start
 ```
 
-O relatório de tickets é salvo localmente no banco SQLite `data/tickets.db`. Os dados são atualizados imediatamente quando alguém abre ou assume um ticket.
+O relatório de tickets é salvo localmente no banco SQLite `data/tickets.db`. Os dados são atualizados imediatamente quando alguém abre ou assume um ticket. O comando `/relatorio` aceita filtros opcionais: use `tipo: respostas` para ver os setores com mais tickets respondidos e as pessoas que mais assumiram atendimentos, e use `mes`/`ano` para consultar um período específico, por exemplo o mês fechado.
 
-Se `CANAL_RELATORIOS_TICKETS_ID` estiver configurado, o comando `/relatorio` publica o relatório nesse canal; caso contrário, ele responde de forma privada para quem executou o comando. O bot também publica automaticamente o relatório toda segunda-feira, a partir da hora definida em `RELATORIO_SEMANAL_HORA`, no horário de São Paulo. Ele guarda no banco a última data publicada para não repetir caso reinicie no mesmo dia.
+O comando `/relatorio` orienta o uso do painel fixado em `CANAL_RELATORIOS_TICKETS_ID`; as consultas do menu aparecem de forma privada para quem executou. O ranking diário é atualizado apenas em `CANAL_RANKING_TICKETS_ID`, uma vez por dia, a partir da hora definida em `RELATORIO_DIARIO_HORA`, no horário de São Paulo. Ele guarda no banco a última data atualizada para não repetir caso reinicie no mesmo dia.
 
 Se existir um relatório antigo em `data/relatorios.json`, o bot tenta importar esses dados para o SQLite na primeira inicialização com o banco vazio.
 
@@ -137,7 +146,21 @@ Ao fechar um ticket, o bot gera um arquivo `transcript-<usuario>-<data>.html` co
 - PDFs com visualizador embutido e botão de download
 - Outros arquivos (DOCX, ZIP, etc.) com botão de download
 
-O arquivo é enviado por DM ao solicitante, por DM ao responsável que assumiu o ticket e postado no canal de logs. Se o canal de tickets fechados do setor estiver configurado no `.env`, ele também recebe uma cópia.
+O transcript pode funcionar de duas formas:
+
+- Sem configuração extra, o bot continua enviando o arquivo HTML como anexo por DM e no canal de fechados.
+- Se `TRANSCRIPT_BASE_URL` estiver configurado, o bot salva o HTML em `TRANSCRIPT_PUBLIC_DIR` e envia um link direto para abrir no navegador.
+
+Se quiser que o próprio processo do bot sirva esses arquivos, configure também `TRANSCRIPT_HTTP_PORT`. Nesse modo, o bot abre um servidor HTTP simples em `TRANSCRIPT_ROUTE_PREFIX` e você pode apontar seu domínio ou reverse proxy para essa porta.
+
+Exemplo:
+
+```env
+TRANSCRIPT_BASE_URL=https://transcripts.seudominio.com.br
+TRANSCRIPT_PUBLIC_DIR=data/public/transcripts
+TRANSCRIPT_ROUTE_PREFIX=/transcripts
+TRANSCRIPT_HTTP_PORT=8099
+```
 
 > **Importante:** os anexos são baixados antes do canal ser deletado e embutidos em base64 no HTML, garantindo que tudo continue funcionando mesmo após o ticket ser fechado.
 
@@ -154,7 +177,7 @@ Certifique-se de que o bot possui as seguintes permissões no servidor:
 | Gerenciar permissões | Configurar permissões nos canais |
 | Enviar mensagens | Postar o painel e mensagens nos tickets |
 | Ler histórico de mensagens | Coletar mensagens para o transcript |
-| Enviar mensagens privadas | Entregar o transcript ao solicitante |
+| Enviar mensagens privadas | Entregar o transcript ao solicitante e ao responsável |
 
 ---
 

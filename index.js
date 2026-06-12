@@ -1,6 +1,8 @@
 require('dotenv').config();
 const fs = require('node:fs');
+const http = require('node:http');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { readEnv, requireEnv } = require('./env');
 const {
@@ -13,10 +15,14 @@ const {
   Client,
   GatewayIntentBits,
   Events,
+  EmbedBuilder,
   ActionRowBuilder,
   StringSelectMenuBuilder,
   UserSelectMenuBuilder,
   RoleSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   ButtonBuilder,
   ButtonStyle,
   ChannelType,
@@ -31,10 +37,10 @@ const client = new Client({
 const dadosTickets = new Map();
 const RELATORIOS_PATH = path.join(__dirname, 'data', 'relatorios.json');
 const DB_PATH = path.resolve(__dirname, readEnv('DATABASE_PATH') || path.join('data', 'tickets.db'));
+const TRANSCRIPT_PUBLIC_DIR = path.resolve(__dirname, readEnv('TRANSCRIPT_PUBLIC_DIR') || path.join('data', 'public', 'transcripts'));
 const env = requireEnv([
   'TOKEN',
   'CANAL_ABERTURA_ID',
-  'CANAL_LOGS_TICKETS_ID',
   'CATEGORIA_RH_ID',
   'CATEGORIA_FINANCEIRO_ID',
   'CATEGORIA_NOC_ID',
@@ -55,8 +61,9 @@ const env = requireEnv([
 
 const CONFIG = {
   canalAberturaId:    env.CANAL_ABERTURA_ID,
-  canalLogsTicketsId: env.CANAL_LOGS_TICKETS_ID,
+  canalAberturaComercialId: readEnv('CANAL_ABERTURA_TICKET_COMERCIAL') || readEnv('CANAL_ABERTURA_COMERCIAL_ID') || readEnv('CANAL_TICKETS_COMERCIAL_ID') || readEnv('CANAL_COMERCIAL_TICKETS_ID'),
   canalRelatoriosTicketsId: readEnv('CANAL_RELATORIOS_TICKETS_ID'),
+  canalRankingTicketsId: readEnv('CANAL_RANKING_TICKETS_ID'),
   setores: {
     rh:          { nome: '🤝 RH',          descricao: 'Solicitações relacionadas a colaboradores, documentos e processos internos.',          categoriaId: env.CATEGORIA_RH_ID,          cargoId: env.CARGO_RH_ID,          canalFechadosId: readEnv('CANAL_FECHADOS_RH_ID') },
     financeiro:  { nome: '💸 Financeiro',  descricao: 'Demandas sobre pagamentos, notas fiscais, faturamento e assuntos financeiros.',       categoriaId: env.CATEGORIA_FINANCEIRO_ID,  cargoId: env.CARGO_FINANCEIRO_ID,  canalFechadosId: readEnv('CANAL_FECHADOS_FINANCEIRO_ID') },
@@ -76,10 +83,114 @@ const esc       = str => String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').
 const extOf     = url => url.split('?')[0].split('.').pop().toLowerCase();
 const eImagem   = url => ['png','jpg','jpeg','gif','webp','svg'].includes(extOf(url));
 const eVideo    = url => ['mp4','webm','mov'].includes(extOf(url));
-const RELATORIO_SEMANAL_HORA = Number(readEnv('RELATORIO_SEMANAL_HORA') || 8);
+const RELATORIO_DIARIO_HORA = Number(readEnv('RELATORIO_DIARIO_HORA') || readEnv('RELATORIO_SEMANAL_HORA') || 8);
+const TRANSCRIPT_BASE_URL = readEnv('TRANSCRIPT_BASE_URL');
+const TRANSCRIPT_HTTP_PORT = Number(readEnv('TRANSCRIPT_HTTP_PORT') || 0);
+const TRANSCRIPT_ROUTE_PREFIX = normalizarPrefixoRota(readEnv('TRANSCRIPT_ROUTE_PREFIX') || '/transcripts');
+const CORES = {
+  ticket: 0x5865F2,
+  atendimento: 0x57F287,
+  transcript: 0xFEE75C,
+  fechado: 0xED4245,
+  relatorio: 0x00A8FC
+};
+
+const COMERCIAL_MOTIVOS = {
+  sem_conexao: 'Sem conexão',
+  conexao_lenta: 'Conexão lenta'
+};
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+fs.mkdirSync(TRANSCRIPT_PUBLIC_DIR, { recursive: true });
 const db = new DatabaseSync(DB_PATH);
+
+function normalizarPrefixoRota(value) {
+  const limpo = String(value || '/transcripts').trim().replace(/\/+$/g, '');
+  if (!limpo || limpo === '/') return '/transcripts';
+  return limpo.startsWith('/') ? limpo : `/${limpo}`;
+}
+
+function normalizarNomeArquivo(nome) {
+  return String(nome || 'transcript.html')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9._-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    || 'transcript.html';
+}
+
+function montarUrlTranscriptPublico(nomePublico) {
+  if (!TRANSCRIPT_BASE_URL) return null;
+  const base = TRANSCRIPT_BASE_URL.replace(/\/+$/g, '');
+  return `${base}${TRANSCRIPT_ROUTE_PREFIX}/${encodeURIComponent(nomePublico)}`;
+}
+
+function publicarTranscriptEmDisco(buffer, nomeArq) {
+  const nomeBase = normalizarNomeArquivo(nomeArq);
+  const nomePublico = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}-${nomeBase}`;
+  const caminho = path.join(TRANSCRIPT_PUBLIC_DIR, nomePublico);
+  fs.writeFileSync(caminho, buffer);
+
+  return {
+    caminho,
+    nomePublico,
+    url: montarUrlTranscriptPublico(nomePublico)
+  };
+}
+
+function iniciarServidorTranscripts() {
+  if (!TRANSCRIPT_HTTP_PORT) return;
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Metodo nao permitido.');
+    }
+
+    if (!url.pathname.startsWith(`${TRANSCRIPT_ROUTE_PREFIX}/`)) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Nao encontrado.');
+    }
+
+    let nomeArquivo = '';
+    try {
+      nomeArquivo = decodeURIComponent(url.pathname.slice(`${TRANSCRIPT_ROUTE_PREFIX}/`.length)).trim();
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('URL invalida.');
+    }
+    if (!nomeArquivo || nomeArquivo.includes('/') || nomeArquivo.includes('\\')) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Arquivo invalido.');
+    }
+
+    const caminho = path.join(TRANSCRIPT_PUBLIC_DIR, nomeArquivo);
+    if (!fs.existsSync(caminho) || !fs.statSync(caminho).isFile()) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('Transcript nao encontrado.');
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'private, max-age=300',
+      'X-Content-Type-Options': 'nosniff'
+    });
+
+    if (req.method === 'HEAD') return res.end();
+    fs.createReadStream(caminho).pipe(res);
+  });
+
+  server.listen(TRANSCRIPT_HTTP_PORT, () => {
+    console.log(`[transcript] Servidor HTTP ativo na porta ${TRANSCRIPT_HTTP_PORT} em ${TRANSCRIPT_ROUTE_PREFIX}`);
+    if (TRANSCRIPT_BASE_URL) console.log(`[transcript] URLs publicas em ${TRANSCRIPT_BASE_URL}${TRANSCRIPT_ROUTE_PREFIX}`);
+  });
+
+  server.on('error', error => {
+    console.error(`[transcript] Falha ao iniciar servidor HTTP: ${formatError(error)}`);
+  });
+}
 
 function iniciarBanco() {
   db.exec(`
@@ -256,54 +367,353 @@ function montarRanking(sql, params, formatarLinha) {
   }).join('\n');
 }
 
-function montarRelatorioTickets() {
-  const ultimoEvento = db.prepare('SELECT MAX(created_at) AS atualizadoEm FROM ticket_events').get();
+function obterAnoSaoPaulo(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric'
+  }).formatToParts(date);
+  return Number(parts.find(part => part.type === 'year')?.value || date.getFullYear());
+}
+
+function obterPeriodoAtualRelatorio(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric',
+    month: '2-digit'
+  }).formatToParts(date);
+  return {
+    ano: Number(parts.find(part => part.type === 'year')?.value || date.getFullYear()),
+    mes: Number(parts.find(part => part.type === 'month')?.value || (date.getMonth() + 1))
+  };
+}
+
+function criarFiltroRelatorio({ mes, ano } = {}) {
+  const anoNormalizado = Number(ano);
+  const anoFiltro = Number.isInteger(anoNormalizado) && anoNormalizado >= 2000 && anoNormalizado <= 9999
+    ? anoNormalizado
+    : null;
+  const mesNormalizado = Number(mes);
+  const mesFiltro = Number.isInteger(mesNormalizado) && mesNormalizado >= 1 && mesNormalizado <= 12
+    ? mesNormalizado
+    : null;
+
+  if (!mesFiltro && !anoFiltro) {
+    return {
+      where: '',
+      params: [],
+      titulo: 'Periodo: todos os registros'
+    };
+  }
+
+  if (!mesFiltro) {
+    const inicio = new Date(anoFiltro, 0, 1, 0, 0, 0, 0);
+    const fim = new Date(anoFiltro + 1, 0, 1, 0, 0, 0, 0);
+    return {
+      where: ' AND created_at >= ? AND created_at < ?',
+      params: [inicio.toISOString(), fim.toISOString()],
+      titulo: `Periodo: ${anoFiltro}`
+    };
+  }
+
+  if (!anoFiltro) {
+    return {
+      where: " AND strftime('%m', created_at) = ?",
+      params: [String(mesFiltro).padStart(2, '0')],
+      titulo: `Periodo: mes ${String(mesFiltro).padStart(2, '0')} em todos os anos`
+    };
+  }
+
+  const inicio = new Date(anoFiltro, mesFiltro - 1, 1, 0, 0, 0, 0);
+  const fim = new Date(anoFiltro, mesFiltro, 1, 0, 0, 0, 0);
+
+  return {
+    where: ' AND created_at >= ? AND created_at < ?',
+    params: [inicio.toISOString(), fim.toISOString()],
+    titulo: `Periodo: ${String(mesFiltro).padStart(2, '0')}/${anoFiltro}`
+  };
+}
+
+function obterAtualizadoRelatorio(filtro) {
+  const ultimoEvento = db.prepare(`SELECT MAX(created_at) AS atualizadoEm FROM ticket_events WHERE 1=1${filtro.where}`).get(...filtro.params);
   const atualizado = ultimoEvento?.atualizadoEm
     ? new Date(ultimoEvento.atualizadoEm).toLocaleString('pt-BR')
     : 'sem data';
+  return atualizado;
+}
 
-  const abertosPorSetor = montarRanking(
-    `SELECT setor_key AS setorKey, setor_nome AS setorNome, COUNT(*) AS total
-       FROM ticket_events
-      WHERE event_type = ?
-      GROUP BY setor_key, setor_nome
-      ORDER BY total DESC
-      LIMIT 5`,
-    ['aberto'],
-    (item, index, total, plural) => `${index + 1}. ${item.setorNome} - **${total}** ${plural}`
-  );
-  const respondidosPorSetor = montarRanking(
-    `SELECT setor_key AS setorKey, setor_nome AS setorNome, COUNT(*) AS total
-       FROM ticket_events
-      WHERE event_type = ?
-      GROUP BY setor_key, setor_nome
-      ORDER BY total DESC
-      LIMIT 5`,
-    ['assumido'],
-    (item, index, total, plural) => `${index + 1}. ${item.setorNome} - **${total}** ${plural}`
-  );
-  const assumidosPorUsuario = montarRanking(
+function rankingUsuariosPorEvento(eventType, filtro, limit = 5) {
+  return montarRanking(
     `SELECT user_id AS userId, COALESCE(MAX(user_tag), MAX(username), user_id) AS nome, COUNT(*) AS total
        FROM ticket_events
-      WHERE event_type = ? AND user_id != 'importado-json'
+      WHERE event_type = ? AND user_id != 'importado-json'${filtro.where}
       GROUP BY user_id
       ORDER BY total DESC
-      LIMIT 5`,
-    ['assumido'],
+      LIMIT ${limit}`,
+    [eventType, ...filtro.params],
     (item, index, total, plural) => `${index + 1}. <@${item.userId}> - **${total}** ${plural}`
   );
-  const abertosPorUsuario = montarRanking(
-    `SELECT user_id AS userId, COALESCE(MAX(user_tag), MAX(username), user_id) AS nome, COUNT(*) AS total
+}
+
+function rankingSetoresPorEvento(eventType, filtro, limit = 10) {
+  return montarRanking(
+    `SELECT setor_key AS setorKey, setor_nome AS setorNome, COUNT(*) AS total
        FROM ticket_events
-      WHERE event_type = ? AND user_id != 'importado-json'
-      GROUP BY user_id
+      WHERE event_type = ?${filtro.where}
+      GROUP BY setor_key, setor_nome
       ORDER BY total DESC
-      LIMIT 5`,
-    ['aberto'],
-    (item, index, total, plural) => `${index + 1}. <@${item.userId}> - **${total}** ${plural}`
+      LIMIT ${limit}`,
+    [eventType, ...filtro.params],
+    (item, index, total, plural) => `${index + 1}. ${item.setorNome} - **${total}** ${plural}`
+  );
+}
+
+function montarGuiaRelatorios() {
+  return [
+    '# Central de relatorios e rankings',
+    '',
+    'Use o botao abaixo para abrir o menu interativo de consulta.',
+    '',
+    '**Como funciona**',
+    '1. Clique em **Abrir menu de relatorio**.',
+    '2. Escolha o tipo de ranking e ajuste mes/ano se quiser.',
+    '3. Clique em **Consultar agora** para publicar o card neste canal.',
+    '',
+    '**Tipos disponiveis**',
+    'Ranking geral: quem mais assumiu tickets e quem mais abriu tickets.',
+    'Ranking de respostas: setores com mais tickets respondidos e pessoas que mais assumiram atendimentos.',
+    '',
+    '**Observacoes**',
+    'Somente administradores podem usar o menu.',
+    'As consultas feitas pelo menu aparecem apenas para quem consultou.',
+    'O canal configurado em `CANAL_RANKING_TICKETS_ID` recebe o ranking automatico diario.'
+  ].join('\n');
+}
+
+function montarRelatorioRespostas({ mes, ano } = {}) {
+  const filtro = criarFiltroRelatorio({ mes, ano });
+  const atualizado = obterAtualizadoRelatorio(filtro);
+  const respondidosPorSetor = rankingSetoresPorEvento('assumido', filtro);
+  const respondidosPorUsuario = rankingUsuariosPorEvento('assumido', filtro, 10);
+
+  return `# Ranking de respostas\n\n${filtro.titulo}\n\n**Setores com mais tickets respondidos**\n${respondidosPorSetor}\n\n**Pessoas que mais assumiram atendimentos**\n${respondidosPorUsuario}\n\nÚltimo registro considerado: ${atualizado}`;
+}
+
+function montarRelatorioTickets({ mes, ano } = {}) {
+  const filtro = criarFiltroRelatorio({ mes, ano });
+  const atualizado = obterAtualizadoRelatorio(filtro);
+  const assumidosPorUsuario = rankingUsuariosPorEvento('assumido', filtro);
+  const abertosPorUsuario = rankingUsuariosPorEvento('aberto', filtro);
+
+  return `# Ranking geral de tickets\n\n${filtro.titulo}\n\n**Pessoas que mais assumiram atendimentos**\n${assumidosPorUsuario}\n\n**Pessoas que mais abriram tickets**\n${abertosPorUsuario}\n\nÚltimo registro considerado: ${atualizado}`;
+}
+
+function montarCardRelatorio({ tipo = 'geral', mes, ano, destaque = 'relatorio' } = {}) {
+  const filtro = criarFiltroRelatorio({ mes, ano });
+  const atualizado = obterAtualizadoRelatorio(filtro);
+  const ehRanking = destaque === 'ranking';
+  const titulo = ehRanking
+    ? (tipo === 'respostas' ? 'Ranking de Respostas' : 'Ranking Geral de Tickets')
+    : (tipo === 'respostas' ? 'Relatorio de Respostas' : 'Relatorio Geral de Tickets');
+  const embed = new EmbedBuilder()
+    .setColor(ehRanking ? CORES.ticket : CORES.relatorio)
+    .setTitle(titulo)
+    .setDescription([
+      filtro.titulo,
+      '',
+      ehRanking
+        ? 'Atualizacao automatica do card de ranking.'
+        : 'Resumo em formato de card para facilitar a leitura no canal.'
+    ].join('\n'))
+    .setFooter({ text: `Ultimo registro considerado: ${atualizado}` })
+    .setTimestamp(new Date());
+
+  if (tipo === 'respostas') {
+    embed.addFields(
+      {
+        name: 'Setores com mais tickets respondidos',
+        value: truncarTexto(rankingSetoresPorEvento('assumido', filtro), 1024),
+        inline: false
+      },
+      {
+        name: 'Pessoas que mais assumiram atendimentos',
+        value: truncarTexto(rankingUsuariosPorEvento('assumido', filtro, 10), 1024),
+        inline: false
+      }
+    );
+    return embed;
+  }
+
+  embed.addFields(
+    {
+      name: 'Pessoas que mais assumiram atendimentos',
+      value: truncarTexto(rankingUsuariosPorEvento('assumido', filtro), 1024),
+      inline: false
+    },
+    {
+      name: 'Pessoas que mais abriram tickets',
+      value: truncarTexto(rankingUsuariosPorEvento('aberto', filtro), 1024),
+      inline: false
+    }
   );
 
-  return `# 📊 Relatório de tickets\n\n**Setor que mais abriu tickets**\n${abertosPorSetor}\n\n**Setor que mais respondeu tickets**\n${respondidosPorSetor}\n\n**Quem mais assumiu tickets**\n${assumidosPorUsuario}\n\n**Quem mais abriu tickets**\n${abertosPorUsuario}\n\nAtualizado em: ${atualizado}`;
+  return embed;
+}
+
+function normalizarEstadoRelatorio({ tipo = 'geral', mes = null, ano = null } = {}) {
+  const tipoValido = tipo === 'respostas' ? 'respostas' : 'geral';
+  const mesNumero = Number(mes);
+  const anoNumero = Number(ano);
+  return {
+    tipo: tipoValido,
+    mes: Number.isInteger(mesNumero) && mesNumero >= 1 && mesNumero <= 12 ? mesNumero : null,
+    ano: Number.isInteger(anoNumero) && anoNumero >= 2000 && anoNumero <= 9999 ? anoNumero : null
+  };
+}
+
+function serializarEstadoRelatorio({ tipo = 'geral', mes = null, ano = null, acao }) {
+  const estado = normalizarEstadoRelatorio({ tipo, mes, ano });
+  return ['painel_relatorio', estado.tipo, estado.mes || 0, estado.ano || 0, acao].join('|');
+}
+
+function parseEstadoRelatorio(customId) {
+  const [prefixo, tipo, mes, ano, acao] = String(customId || '').split('|');
+  if (prefixo !== 'painel_relatorio' || !acao) return null;
+  return {
+    ...normalizarEstadoRelatorio({ tipo, mes: Number(mes), ano: Number(ano) }),
+    acao
+  };
+}
+
+function obterAnosRelatorio() {
+  const anoAtual = obterPeriodoAtualRelatorio().ano;
+  const anosRegistrados = db.prepare(`
+    SELECT DISTINCT CAST(strftime('%Y', created_at) AS INTEGER) AS ano
+      FROM ticket_events
+     WHERE created_at IS NOT NULL
+     ORDER BY ano DESC
+     LIMIT 24
+  `).all()
+    .map(item => Number(item.ano))
+    .filter(ano => Number.isInteger(ano) && ano >= 2000 && ano <= 9999);
+
+  return [...new Set([anoAtual, ...anosRegistrados])].sort((a, b) => b - a).slice(0, 24);
+}
+
+function criarMenuTipoRelatorio(estado) {
+  return new StringSelectMenuBuilder()
+    .setCustomId(serializarEstadoRelatorio({ ...estado, acao: 'tipo' }))
+    .setPlaceholder('Escolha o tipo de relatorio')
+    .addOptions(
+      { label: 'Ranking geral', description: 'Quem mais assumiu e quem mais abriu tickets', value: 'geral', default: estado.tipo === 'geral' },
+      { label: 'Ranking de respostas', description: 'Setores e pessoas com mais atendimentos assumidos', value: 'respostas', default: estado.tipo === 'respostas' }
+    );
+}
+
+function criarMenuMesRelatorio(estado) {
+  const meses = [
+    'Janeiro', 'Fevereiro', 'Marco', 'Abril', 'Maio', 'Junho',
+    'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'
+  ];
+  return new StringSelectMenuBuilder()
+    .setCustomId(serializarEstadoRelatorio({ ...estado, acao: 'mes' }))
+    .setPlaceholder('Filtrar por mes')
+    .addOptions(
+      { label: 'Todos os meses', description: 'Consulta o historico completo', value: '0', default: !estado.mes },
+      ...meses.map((mes, index) => ({
+        label: mes,
+        description: `Consultar apenas ${mes.toLowerCase()}`,
+        value: String(index + 1),
+        default: estado.mes === (index + 1)
+      }))
+    );
+}
+
+function criarMenuAnoRelatorio(estado) {
+  const anos = obterAnosRelatorio();
+  return new StringSelectMenuBuilder()
+    .setCustomId(serializarEstadoRelatorio({ ...estado, acao: 'ano' }))
+    .setPlaceholder('Filtrar por ano')
+    .addOptions(
+      {
+        label: 'Todos os anos',
+        description: 'Inclui registros de todos os anos',
+        value: '0',
+        default: !estado.ano
+      },
+      ...anos.map(ano => ({
+        label: String(ano),
+        description: `Consultar registros de ${ano}`,
+        value: String(ano),
+        default: estado.ano === ano
+      }))
+    );
+}
+
+function montarResumoPainelRelatorio(estado) {
+  const tipoTexto = estado.tipo === 'respostas' ? 'Ranking de respostas' : 'Ranking geral';
+  const mesTexto = estado.mes ? String(estado.mes).padStart(2, '0') : 'Todos';
+  const anoTexto = estado.ano || 'Todos';
+  return new EmbedBuilder()
+    .setColor(CORES.relatorio)
+    .setTitle('Menu De Consulta De Relatorios')
+    .setDescription('Escolha os filtros abaixo e visualize o card em modo privado.')
+    .addFields(
+      { name: 'Tipo selecionado', value: tipoTexto, inline: true },
+      { name: 'Mes', value: String(mesTexto), inline: true },
+      { name: 'Ano', value: String(anoTexto), inline: true }
+    )
+    .setFooter({ text: 'O resultado aparece apenas para voce e some em 5 minutos.' });
+}
+
+function montarPainelRelatorioInterativo(estado = {}) {
+  const estadoNormalizado = normalizarEstadoRelatorio(estado);
+  return {
+    content: 'Selecione os filtros e clique em `Consultar agora`.',
+    embeds: [montarResumoPainelRelatorio(estadoNormalizado)],
+    components: [
+      row(criarMenuTipoRelatorio(estadoNormalizado)),
+      row(criarMenuMesRelatorio(estadoNormalizado)),
+      row(criarMenuAnoRelatorio(estadoNormalizado)),
+      row(
+        new ButtonBuilder()
+          .setCustomId(serializarEstadoRelatorio({ ...estadoNormalizado, acao: 'consultar' }))
+          .setLabel('Consultar agora')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(serializarEstadoRelatorio({ tipo: 'geral', mes: null, ano: null, acao: 'limpar' }))
+          .setLabel('Limpar filtros')
+          .setStyle(ButtonStyle.Secondary)
+      )
+    ]
+  };
+}
+
+function agendarLimpezaRespostaRelatorio(interaction, delayMs = 5 * 60 * 1000) {
+  setTimeout(() => {
+    interaction.deleteReply().catch(() => {});
+  }, delayMs);
+}
+
+function montarPainelFixoRelatorios() {
+  const embed = new EmbedBuilder()
+    .setColor(CORES.relatorio)
+    .setTitle('Central De Relatorios')
+    .setDescription('Abra o menu interativo para consultar relatorios sem poluir o canal.')
+    .addFields(
+      { name: 'Acesso', value: 'Somente administradores podem abrir e usar o painel.', inline: false },
+      { name: 'Privacidade', value: 'Os cards gerados pelo menu aparecem apenas para quem fez a consulta.', inline: false }
+    );
+
+  return {
+    content: montarGuiaRelatorios(),
+    embeds: [embed],
+    components: [row(
+      new ButtonBuilder()
+        .setCustomId('abrir_menu_relatorio')
+        .setLabel('Abrir menu de relatorio')
+        .setStyle(ButtonStyle.Primary)
+    )]
+  };
 }
 
 const MIME = {
@@ -367,16 +777,24 @@ function renderAnexo(anexo, b64) {
     </div>`;
 }
 
-function renderEmbed(embed) {
+function formatarTextoTranscript(texto, rCargo, rUser, rCanal) {
+  return esc(texto)
+    .replace(/&lt;@!?(\d+)&gt;/g,   (_, id) => `<span class="mention">@${esc(rUser(id))}</span>`)
+    .replace(/&lt;@&amp;(\d+)&gt;/g, (_, id) => `<span class="mention role">@${esc(rCargo(id))}</span>`)
+    .replace(/&lt;#(\d+)&gt;/g,      (_, id) => `<span class="mention channel">#${esc(rCanal(id))}</span>`)
+    .replace(/\n/g, '<br>');
+}
+
+function renderEmbed(embed, rCargo, rUser, rCanal) {
   const cor = embed.color ? '#' + embed.color.toString(16).padStart(6, '0') : '#5865F2';
   let h = `<div class="embed" style="border-left-color:${cor}">`;
   if (embed.author?.name)  h += `<div class="embed-author">${esc(embed.author.name)}</div>`;
   if (embed.title)         h += `<div class="embed-title">${esc(embed.title)}</div>`;
-  if (embed.description)   h += `<div class="embed-description">${esc(embed.description)}</div>`;
+  if (embed.description)   h += `<div class="embed-description">${formatarTextoTranscript(embed.description, rCargo, rUser, rCanal)}</div>`;
   if (embed.fields?.length) {
     h += `<div class="embed-fields">`;
     for (const f of embed.fields)
-      h += `<div class="embed-field${f.inline ? ' inline' : ''}"><div class="field-name">${esc(f.name)}</div><div class="field-value">${esc(f.value)}</div></div>`;
+      h += `<div class="embed-field${f.inline ? ' inline' : ''}"><div class="field-name">${esc(f.name)}</div><div class="field-value">${formatarTextoTranscript(f.value, rCargo, rUser, rCanal)}</div></div>`;
     h += `</div>`;
   }
   if (embed.image?.url)   h += `<img class="embed-image" src="${esc(embed.image.url)}" loading="lazy" />`;
@@ -402,11 +820,7 @@ function gerarTranscriptHtml(dados, mensagens, fechadoPor, rCargo, rUser, rCanal
     const corpo = msgs.map(msg => {
       let c = '';
       if (msg.content) {
-        const txt = esc(msg.content)
-          .replace(/&lt;@!?(\d+)&gt;/g,   (_, id) => `<span class="mention">@${esc(rUser(id))}</span>`)
-          .replace(/&lt;@&amp;(\d+)&gt;/g, (_, id) => `<span class="mention role">@${esc(rCargo(id))}</span>`)
-          .replace(/&lt;#(\d+)&gt;/g,      (_, id) => `<span class="mention channel">#${esc(rCanal(id))}</span>`)
-          .replace(/\n/g, '<br>');
+        const txt = formatarTextoTranscript(msg.content, rCargo, rUser, rCanal);
         c += `<div class="message-content">${txt}</div>`;
       }
       if (msg.attachments.size) {
@@ -414,7 +828,7 @@ function gerarTranscriptHtml(dados, mensagens, fechadoPor, rCargo, rUser, rCanal
         for (const [, a] of msg.attachments) c += renderAnexo(a, b64);
         c += `</div>`;
       }
-      for (const e of msg.embeds ?? []) c += renderEmbed(e);
+      for (const e of msg.embeds ?? []) c += renderEmbed(e, rCargo, rUser, rCanal);
       if (!c) c = `<div class="message-content deleted">[mensagem sem conteúdo]</div>`;
       const hora = msg.createdAt.toLocaleString('pt-BR', { hour: '2-digit', minute: '2-digit' });
       return `<div class="message-line"><span class="message-time" title="${msg.createdAt.toLocaleString('pt-BR')}">${hora}</span>${c}</div>`;
@@ -538,11 +952,168 @@ body{font-family:'Noto Sans',sans-serif;font-size:15px;background:var(--bg-terti
 </body></html>`;
 }
 
-function criarMenuSetores() {
+function truncarTexto(texto, limite = 1024) {
+  const valor = String(texto || '');
+  return valor.length > limite ? `${valor.slice(0, limite - 1)}…` : valor;
+}
+
+function montarCardTranscript({ titulo, descricao, urlPublica, dados, interaction }) {
+  const embed = new EmbedBuilder()
+    .setColor(urlPublica ? CORES.transcript : CORES.fechado)
+    .setTitle(titulo)
+    .setDescription(descricao)
+    .addFields(
+      { name: 'Ticket', value: `#${dados.canalNome}`, inline: true },
+      { name: 'Setor', value: dados.setorNome, inline: true },
+      { name: 'Solicitante', value: `<@${dados.solicitanteId}>`, inline: true },
+      { name: 'Responsavel', value: dados.responsavelId ? `<@${dados.responsavelId}>` : 'Nao assumido', inline: true },
+      { name: 'Fechado por', value: `<@${interaction.user.id}>`, inline: true },
+      { name: 'Acesso', value: urlPublica ? `[Abrir transcript](${urlPublica})` : 'Arquivo HTML anexado abaixo.', inline: true }
+    )
+    .setTimestamp(new Date());
+
+  return embed;
+}
+
+function montarPayloadTranscriptHtml({ titulo, descricao, buffer, nomeArq, urlPublica, dados, interaction, content }) {
+  const embed = montarCardTranscript({ titulo, descricao, urlPublica, dados, interaction });
+  if (urlPublica) {
+    return {
+      content,
+      embeds: [embed]
+    };
+  }
+
+  return {
+    content,
+    embeds: [embed],
+    files: [new AttachmentBuilder(buffer, { name: nomeArq })]
+  };
+}
+
+async function enviarTranscriptHtml(destino, payload) {
+  const mensagem = await destino.send(payload).catch(e => {
+    console.error(e);
+    return null;
+  });
+
+  const htmlUrl = mensagem?.attachments?.first()?.url;
+  if (htmlUrl) {
+    const content = `${payload.content}\n\n🔗 Baixar transcript HTML: ${htmlUrl}`;
+    await mensagem.edit({ content }).catch(e => console.error(e));
+  }
+
+  return Boolean(mensagem);
+}
+
+function criarMenuSetores({ incluirComercial = true } = {}) {
+  const setores = Object.entries(CONFIG.setores)
+    .filter(([value]) => incluirComercial || value !== 'comercial');
+
   return new StringSelectMenuBuilder()
     .setCustomId('selecionar_setor')
     .setPlaceholder('Selecione o setor para abrir o ticket')
-    .addOptions(Object.entries(CONFIG.setores).map(([value, { nome, descricao }]) => ({ label: nome, description: descricao.slice(0, 100), value })));
+    .addOptions(setores.map(([value, { nome, descricao }]) => ({ label: nome, description: descricao.slice(0, 100), value })));
+}
+
+function montarPainelTicketsComercial() {
+  return {
+    content: [
+      '# Atendimento Comercial Para Suporte',
+      '',
+      'Abra um ticket para o suporte quando o cliente estiver em loja com problema de conexão.'
+    ].join('\n'),
+    components: [row(
+      new ButtonBuilder()
+        .setCustomId('abrir_ticket_comercial')
+        .setLabel('Abrir ticket para suporte')
+        .setStyle(ButtonStyle.Primary)
+    )]
+  };
+}
+
+function criarModalComercial() {
+  return new ModalBuilder()
+    .setCustomId('modal_ticket_comercial')
+    .setTitle('Ticket Comercial Para Suporte')
+    .addComponents(
+      row(new TextInputBuilder()
+        .setCustomId('cliente_id')
+        .setLabel('ID do cliente')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(80)),
+      row(new TextInputBuilder()
+        .setCustomId('relato')
+        .setLabel('Relato do cliente')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setMaxLength(1000)),
+      row(new TextInputBuilder()
+        .setCustomId('atendente')
+        .setLabel('Nome de quem esta solicitando')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(120)),
+      row(new TextInputBuilder()
+        .setCustomId('telefone')
+        .setLabel('Telefone de contato')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(40)),
+      row(new TextInputBuilder()
+        .setCustomId('motivo')
+        .setLabel('Motivo: sem conexao ou conexao lenta')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setPlaceholder('Sem conexao ou Conexao lenta')
+        .setMaxLength(40))
+    );
+}
+
+function normalizarMotivoComercial(valor) {
+  const motivo = normalize(valor);
+  if (['semconexao', 'semconexaoointernet', 'semsinal'].includes(motivo)) return COMERCIAL_MOTIVOS.sem_conexao;
+  if (['conexaolenta', 'lentidao', 'internetlenta'].includes(motivo)) return COMERCIAL_MOTIVOS.conexao_lenta;
+  return null;
+}
+
+function lerDadosFormularioComercial(interaction) {
+  const campo = id => interaction.fields.getTextInputValue(id).trim();
+  const dados = {
+    clienteId: campo('cliente_id'),
+    relato: campo('relato'),
+    atendente: campo('atendente'),
+    telefone: campo('telefone'),
+    motivoInformado: campo('motivo')
+  };
+
+  const camposObrigatorios = [
+    ['ID do cliente', dados.clienteId],
+    ['Relato', dados.relato],
+    ['Nome do atendente', dados.atendente],
+    ['Telefone de contato', dados.telefone],
+    ['Motivo', dados.motivoInformado]
+  ];
+  const faltando = camposObrigatorios.filter(([, valor]) => !valor).map(([nome]) => nome);
+  const motivo = normalizarMotivoComercial(dados.motivoInformado);
+
+  return {
+    ok: !faltando.length && Boolean(motivo),
+    faltando,
+    motivo,
+    dados
+  };
+}
+
+function montarResumoComercial(formulario) {
+  return [
+    `**ID do cliente:** ${formulario.clienteId}`,
+    `**Relato:** ${formulario.relato}`,
+    `**Solicitante/atendente:** ${formulario.atendente}`,
+    `**Telefone de contato:** ${formulario.telefone}`,
+    `**Motivo:** ${formulario.motivo}`
+  ].join('\n');
 }
 
 function criarBotoesTicket(ticketId) {
@@ -556,15 +1127,95 @@ function criarBotoesTicket(ticketId) {
 
 function montarMensagemTicket(ticketId) {
   const d = dadosTickets.get(ticketId);
-  if (!d) return 'Dados do ticket não encontrados.';
-  return `# 🎫 Ticket Aberto\n\n**Solicitante:** <@${d.solicitanteId}>\n**Setor:** ${d.setorNome}\n**Descrição do setor:** ${d.setorDescricao}\n**Cargo responsável:** <@&${d.cargoSetorId}>\n**Status:** ${d.responsavelId ? 'Em atendimento' : 'Aguardando atendimento'}\n**Responsável:** ${d.responsavelId ? `<@${d.responsavelId}>` : 'Ainda não assumido'}\n\nDescreva sua solicitação com o máximo de detalhes possível para agilizar o atendimento.`;
+  if (!d) return { content: 'Dados do ticket não encontrados.' };
+
+  const emAtendimento = Boolean(d.responsavelId);
+  const embed = new EmbedBuilder()
+    .setColor(emAtendimento ? CORES.atendimento : CORES.ticket)
+    .setTitle(emAtendimento ? 'Ticket Em Atendimento' : 'Ticket Aberto')
+    .setDescription(truncarTexto(d.setorDescricao, 400))
+    .addFields(
+      { name: 'Solicitante', value: `<@${d.solicitanteId}>`, inline: true },
+      { name: 'Setor', value: d.setorNome, inline: true },
+      { name: 'Cargo responsavel', value: `<@&${d.cargoSetorId}>`, inline: true },
+      { name: 'Status', value: emAtendimento ? 'Em atendimento' : 'Aguardando atendimento', inline: true },
+      { name: 'Responsavel', value: d.responsavelId ? `<@${d.responsavelId}>` : 'Ainda nao assumido', inline: true },
+      { name: 'Canal', value: `#${d.canalNome}`, inline: true }
+    )
+    .setFooter({ text: 'Descreva sua solicitacao com o maximo de detalhes possivel para agilizar o atendimento.' })
+    .setTimestamp(new Date());
+
+  if (d.formularioComercial) {
+    embed.addFields(
+      { name: 'Origem', value: 'Comercial / loja', inline: true },
+      { name: 'ID do cliente', value: truncarTexto(d.formularioComercial.clienteId, 1024), inline: true },
+      { name: 'Motivo', value: truncarTexto(d.formularioComercial.motivo, 1024), inline: true },
+      { name: 'Atendente', value: truncarTexto(d.formularioComercial.atendente, 1024), inline: true },
+      { name: 'Telefone de contato', value: truncarTexto(d.formularioComercial.telefone, 1024), inline: true },
+      { name: 'Relato', value: truncarTexto(d.formularioComercial.relato, 1024), inline: false }
+    );
+  }
+
+  return { embeds: [embed] };
 }
 
 const podeAdicionarAoTicket = ({ user }, d) =>
-  Boolean(user && (d.solicitanteId === user.id || d.responsavelId === user.id));
+  Boolean(user && d && (d.solicitanteId === user.id || d.responsavelId === user.id));
 
 const podeFecharTicket = ({ user }, d) =>
-  Boolean(user && (d.solicitanteId === user.id || d.responsavelId === user.id));
+  Boolean(user && d && (d.solicitanteId === user.id || d.responsavelId === user.id));
+
+async function abrirTicketSetor(interaction, setorKey, extras = {}) {
+  const setor = CONFIG.setores[setorKey];
+  if (!setor?.categoriaId || !setor?.cargoId) {
+    return { ok: false, motivo: 'Setor inválido ou configuração incompleta.' };
+  }
+
+  const categoria = await interaction.guild.channels.fetch(setor.categoriaId).catch(() => null);
+  if (!categoria || categoria.type !== ChannelType.GuildCategory) {
+    return { ok: false, motivo: 'Categoria do setor não encontrada.' };
+  }
+
+  const numeroTicket = interaction.guild.channels.cache.filter(c => c.parentId === setor.categoriaId && c.type === ChannelType.GuildText).size + 1;
+  const nomeCanal = `ticket-${normalize(setor.nome)}-${numeroTicket}`;
+
+  const canalTicket = await interaction.guild.channels.create({
+    name: nomeCanal, type: ChannelType.GuildText, parent: setor.categoriaId,
+    topic: `Ticket de ${interaction.user.tag} | Setor: ${setor.nome}`,
+    permissionOverwrites: [
+      { id: interaction.guild.id,            deny:  [PermissionFlagsBits.ViewChannel] },
+      { id: interaction.user.id,             allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+      { id: setor.cargoId,                   allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+      { id: interaction.guild.members.me.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] }
+    ]
+  });
+
+  const cargoObj = await interaction.guild.roles.fetch(setor.cargoId).catch(() => null);
+  const dadosTicket = {
+    ticketId: canalTicket.id,
+    setorKey,
+    solicitanteId: interaction.user.id, solicitanteTag: interaction.user.tag,
+    setorNome: setor.nome, setorDescricao: setor.descricao,
+    cargoSetorId: setor.cargoId, cargoSetorNome: cargoObj?.name || 'Desconhecido',
+    responsavelId: null, responsavelTag: null, numeroTicket, canalNome: nomeCanal,
+    ...extras
+  };
+
+  dadosTickets.set(canalTicket.id, dadosTicket);
+  try {
+    registrarTicketAberto(interaction, dadosTicket);
+  } catch (error) {
+    console.error(`[relatorios] Falha ao registrar ticket aberto: ${formatError(error)}`);
+  }
+
+  const origemComercial = extras.formularioComercial
+    ? `\n\n${montarResumoComercial(extras.formularioComercial)}`
+    : '';
+  await canalTicket.send({ content: `<@&${setor.cargoId}> novo ticket aberto por ${interaction.user}.${origemComercial}` });
+  await canalTicket.send({ ...montarMensagemTicket(canalTicket.id), components: [criarBotoesTicket(canalTicket.id)] });
+
+  return { ok: true, canal: canalTicket };
+}
 
 async function garantirPainelFixo(guild) {
   const canal = await guild.channels.fetch(CONFIG.canalAberturaId).catch(() => null);
@@ -572,7 +1223,26 @@ async function garantirPainelFixo(guild) {
   const msgs = await canal.messages.fetch({ limit: 20 }).catch(() => null);
   if (!msgs) return;
   const existente = msgs.find(m => m.author.id === client.user.id && m.components?.[0]?.components?.[0]?.data?.custom_id === 'selecionar_setor');
-  const payload   = { content: `# 🎫 Central de Tickets\n\nSelecione abaixo o setor responsável pelo seu atendimento.`, components: [row(criarMenuSetores())] };
+  const payload   = {
+    content: `# 🎫 Central de Tickets\n\nSelecione abaixo o setor responsável pelo seu atendimento.`,
+    components: [row(criarMenuSetores({ incluirComercial: !CONFIG.canalAberturaComercialId }))]
+  };
+  existente ? await existente.edit(payload).catch(() => {}) : await canal.send(payload).catch(() => {});
+}
+
+async function garantirPainelComercialFixo(guild) {
+  if (!CONFIG.canalAberturaComercialId) return;
+
+  const canal = await guild.channels.fetch(CONFIG.canalAberturaComercialId).catch(() => null);
+  if (!canal || canal.type !== ChannelType.GuildText) {
+    console.error('[tickets] Canal de abertura comercial nao encontrado ou nao e um canal de texto.');
+    return;
+  }
+
+  const msgs = await canal.messages.fetch({ limit: 20 }).catch(() => null);
+  if (!msgs) return;
+  const existente = msgs.find(m => m.author.id === client.user.id && m.components?.[0]?.components?.[0]?.data?.custom_id === 'abrir_ticket_comercial');
+  const payload = montarPainelTicketsComercial();
   existente ? await existente.edit(payload).catch(() => {}) : await canal.send(payload).catch(() => {});
 }
 
@@ -605,14 +1275,165 @@ async function enviarTranscriptPorDm(userId, payload) {
   if (!userId) return false;
   const user = await client.users.fetch(userId).catch(() => null);
   if (!user) return false;
-  await user.send(payload).catch(() => {});
+  return enviarTranscriptHtml(user, payload);
+}
+
+async function enviarTranscriptEmCanal(canal, payload) {
+  if (!canal?.isTextBased()) return false;
+  return enviarTranscriptHtml(canal, payload);
+}
+
+async function buscarCanalTexto(guild, channelId, contexto) {
+  if (!channelId) return null;
+  const canal = await guild.channels.fetch(channelId).catch(error => {
+    console.error(`[${contexto}] Falha ao buscar canal ${channelId}: ${formatError(error)}`);
+    return null;
+  });
+  return canal?.isTextBased() ? canal : null;
+}
+
+function criarResolversTranscript(guild) {
+  return {
+    cargo: criarResolver(guild, async (g, id) => (await g.roles.fetch(id).catch(() => null))?.name || id),
+    user:  criarResolver(guild, async (g, id) => {
+      const m = await g.members.fetch(id).catch(() => null);
+      return m?.displayName || m?.user?.username || id;
+    }),
+    canal: criarResolver(guild, async (g, id) => (await g.channels.fetch(id).catch(() => null))?.name || id)
+  };
+}
+
+async function preencherResolversTranscript(mensagens, resolvers) {
+  const textosMensagem = msg => [
+    msg.content,
+    ...((msg.embeds ?? []).flatMap(embed => [
+      embed.title,
+      embed.description,
+      embed.author?.name,
+      embed.footer?.text,
+      ...((embed.fields ?? []).flatMap(field => [field.name, field.value]))
+    ]))
+  ].filter(Boolean);
+
+  for (const msg of mensagens) {
+    for (const texto of textosMensagem(msg)) {
+      for (const m of texto.matchAll(/<@&(\d+)>/g))  await resolvers.cargo(m[1]);
+      for (const m of texto.matchAll(/<@!?(\d+)>/g)) await resolvers.user(m[1]);
+      for (const m of texto.matchAll(/<#(\d+)>/g))   await resolvers.canal(m[1]);
+    }
+  }
+}
+
+async function atualizarNomesTranscript(dados, resolvers) {
+  if (dados.solicitanteId) {
+    dados.solicitanteTag = await resolvers.user(dados.solicitanteId);
+  }
+
+  if (dados.cargoSetorId) {
+    dados.cargoSetorNome = await resolvers.cargo(dados.cargoSetorId);
+  }
+}
+
+async function baixarAnexosTranscript(mensagens) {
+  const anexos = new Map();
+  for (const msg of mensagens) {
+    for (const [, anexo] of msg.attachments) {
+      const baixado = await baixarAnexo(anexo);
+      if (baixado) anexos.set(anexo.id, baixado);
+    }
+  }
+  return anexos;
+}
+
+function nomeArquivoTranscript(dados, date = new Date()) {
+  const dataStr = date.toLocaleDateString('pt-BR').replace(/\//g, '-');
+  const userNorm = normalize(dados.solicitanteTag.split('#')[0]);
+  return `transcript-${userNorm}-${dataStr}.html`;
+}
+
+async function prepararTranscriptTicket(interaction, dados, mensagens) {
+  const resolvers = criarResolversTranscript(interaction.guild);
+  await preencherResolversTranscript(mensagens, resolvers);
+  await atualizarNomesTranscript(dados, resolvers);
+  const anexos = await baixarAnexosTranscript(mensagens);
+  const nomeArq = nomeArquivoTranscript(dados);
+  const buffer = Buffer.from(gerarTranscriptHtml(
+    dados,
+    mensagens,
+    interaction.user.tag,
+    resolvers.cargo.sync,
+    resolvers.user.sync,
+    resolvers.canal.sync,
+    anexos
+  ), 'utf-8');
+
+  let publicacao = null;
+  if (TRANSCRIPT_BASE_URL) {
+    try {
+      publicacao = publicarTranscriptEmDisco(buffer, nomeArq);
+    } catch (error) {
+      console.error(`[transcript] Falha ao publicar transcript em disco: ${formatError(error)}`);
+    }
+  }
+
+  return { buffer, nomeArq, urlPublica: publicacao?.url || null };
+}
+
+async function enviarTranscriptTicket(interaction, dados, transcript) {
+  const { buffer, nomeArq, urlPublica } = transcript;
+
+  await enviarTranscriptPorDm(dados.solicitanteId, montarPayloadTranscriptHtml({
+    titulo: 'Transcript Do Ticket',
+    descricao: 'Seu transcript ja esta pronto para visualizacao.',
+    buffer,
+    nomeArq,
+    urlPublica,
+    dados,
+    interaction
+  }));
+
+  if (dados.responsavelId && dados.responsavelId !== dados.solicitanteId) {
+    await enviarTranscriptPorDm(dados.responsavelId, montarPayloadTranscriptHtml({
+      titulo: 'Transcript Do Atendimento',
+      descricao: `O transcript do ticket assumido por voce ja esta disponivel.\nSolicitante: ${dados.solicitanteTag}.`,
+      buffer,
+      nomeArq,
+      urlPublica,
+      dados,
+      interaction
+    }));
+  }
+
+  const canalFechadosSetorId = dados.setorKey ? CONFIG.setores[dados.setorKey]?.canalFechadosId : null;
+  const canalFechadosSetor = await buscarCanalTexto(interaction.guild, canalFechadosSetorId, 'transcript');
+  if (!canalFechadosSetor) return false;
+
+  const responsavelLinha = dados.responsavelId
+    ? `👨‍💼 Assumido por <@${dados.responsavelId}>`
+    : '👨‍💼 Ticket não foi assumido';
+
+  await enviarTranscriptEmCanal(canalFechadosSetor, montarPayloadTranscriptHtml({
+    titulo: `Ticket Fechado Em ${dados.setorNome}`,
+    descricao: responsavelLinha,
+    buffer,
+    nomeArq,
+    urlPublica,
+    dados,
+    interaction,
+    content: `📁 Ticket fechado no setor **${dados.setorNome}**`
+  }));
+
   return true;
 }
 
 async function publicarRelatorioTickets(interaction) {
-  const relatorio = montarRelatorioTickets();
+  const tipo = interaction.options?.getString('tipo') || 'geral';
+  const mes = interaction.options?.getInteger('mes') || null;
+  const ano = interaction.options?.getInteger('ano') || null;
+  const embed = montarCardRelatorio({ tipo, mes, ano, destaque: 'relatorio' });
+
   if (!CONFIG.canalRelatoriosTicketsId) {
-    return interaction.reply({ content: relatorio, flags: 64 });
+    return interaction.reply({ embeds: [embed], flags: 64 });
   }
 
   const canal = await interaction.guild.channels.fetch(CONFIG.canalRelatoriosTicketsId).catch(() => null);
@@ -620,8 +1441,15 @@ async function publicarRelatorioTickets(interaction) {
     return interaction.reply(ephemeral('Canal de relatórios não encontrado ou não é um canal de texto.'));
   }
 
-  await canal.send({ content: relatorio });
+  await canal.send({ embeds: [embed] });
   return interaction.reply(ephemeral(`Relatório enviado em <#${CONFIG.canalRelatoriosTicketsId}>.`));
+}
+
+async function publicarRelatorioPorEstado(guild, estado) {
+  return {
+    ok: true,
+    embed: montarCardRelatorio({ ...estado, destaque: 'relatorio' })
+  };
 }
 
 function dataHoraSaoPaulo(date = new Date()) {
@@ -642,7 +1470,7 @@ function dataHoraSaoPaulo(date = new Date()) {
   };
 }
 
-async function publicarRelatorioSemanal() {
+async function publicarRelatorioDiario() {
   if (!CONFIG.canalRelatoriosTicketsId) return false;
 
   const canal = await client.channels.fetch(CONFIG.canalRelatoriosTicketsId).catch(() => null);
@@ -651,31 +1479,136 @@ async function publicarRelatorioSemanal() {
     return false;
   }
 
-  await canal.send({ content: montarRelatorioTickets() });
+  await canal.send({ embeds: [montarCardRelatorio({ tipo: 'geral', destaque: 'relatorio' })] });
   return true;
 }
 
-async function verificarRelatorioSemanal() {
-  const agora = dataHoraSaoPaulo();
-  if (agora.weekday !== 'Mon' || agora.hour < RELATORIO_SEMANAL_HORA) return;
-  if (lerEstadoBot('ultimo_relatorio_semanal') === agora.dateKey) return;
+async function publicarRankingDiario() {
+  if (!CONFIG.canalRankingTicketsId) return false;
 
-  const publicado = await publicarRelatorioSemanal();
+  const canal = await client.channels.fetch(CONFIG.canalRankingTicketsId).catch(() => null);
+  if (!canal?.isTextBased()) {
+    console.error('[rankings] Canal de rankings não encontrado ou não é um canal de texto.');
+    return false;
+  }
+
+  const payload = { embeds: [montarCardRelatorio({ tipo: 'geral', destaque: 'ranking' })] };
+  const stateKey = 'ranking_diario_msg_id';
+  const messageId = lerEstadoBot(stateKey);
+  let mensagem = messageId ? await canal.messages.fetch(messageId).catch(() => null) : null;
+
+  if (!mensagem) {
+    const mensagens = await canal.messages.fetch({ limit: 50 }).catch(() => null);
+    mensagem = mensagens?.find(msg =>
+      msg.author.id === client.user.id &&
+      msg.embeds?.[0]?.title === 'Ranking Geral de Tickets'
+    ) || null;
+  }
+
+  if (mensagem) {
+    await mensagem.edit(payload).catch(error => {
+      console.error(`[rankings] Falha ao atualizar ranking diario fixo: ${formatError(error)}`);
+    });
+  } else {
+    mensagem = await canal.send(payload).catch(error => {
+      console.error(`[rankings] Falha ao enviar ranking diario fixo: ${formatError(error)}`);
+      return null;
+    });
+  }
+
+  if (!mensagem) return false;
+
+  salvarEstadoBot(stateKey, mensagem.id);
+  if (!mensagem.pinned) {
+    await mensagem.pin('Ranking diario fixo').catch(error => {
+      console.error(`[rankings] Falha ao fixar ranking diario: ${formatError(error)}`);
+    });
+  }
+
+  return true;
+}
+
+async function garantirGuiaRelatoriosFixo() {
+  if (!CONFIG.canalRelatoriosTicketsId) return false;
+
+  const canal = await client.channels.fetch(CONFIG.canalRelatoriosTicketsId).catch(() => null);
+  if (!canal?.isTextBased()) {
+    console.error('[relatorios] Canal de relatórios não encontrado para publicar o guia.');
+    return false;
+  }
+
+  const payload = montarPainelFixoRelatorios();
+  const stateKey = 'guia_relatorios_msg_id';
+  const messageId = lerEstadoBot(stateKey);
+  let mensagem = messageId ? await canal.messages.fetch(messageId).catch(() => null) : null;
+
+  if (!mensagem) {
+    const mensagens = await canal.messages.fetch({ limit: 50 }).catch(() => null);
+    mensagem = mensagens?.find(msg =>
+      msg.author.id === client.user.id &&
+      (msg.content.startsWith('# Como consultar relatórios e rankings')
+        || msg.content.startsWith('# Central de relatorios e rankings'))
+    ) || null;
+  }
+
+  if (mensagem) {
+    await mensagem.edit(payload).catch(error => console.error(`[relatorios] Falha ao atualizar guia: ${formatError(error)}`));
+  } else {
+    mensagem = await canal.send(payload).catch(error => {
+      console.error(`[relatorios] Falha ao enviar guia: ${formatError(error)}`);
+      return null;
+    });
+  }
+
+  if (!mensagem) return false;
+
+  salvarEstadoBot(stateKey, mensagem.id);
+  if (!mensagem.pinned) {
+    await mensagem.pin('Guia de uso dos relatórios').catch(error => {
+      console.error(`[relatorios] Falha ao fixar guia: ${formatError(error)}`);
+    });
+  }
+
+  return true;
+}
+
+async function verificarRelatorioDiario() {
+  const agora = dataHoraSaoPaulo();
+  if (agora.hour < RELATORIO_DIARIO_HORA) return;
+  if (lerEstadoBot('ultimo_relatorio_diario') === agora.dateKey) return;
+
+  const publicado = await publicarRelatorioDiario();
   if (publicado) {
-    salvarEstadoBot('ultimo_relatorio_semanal', agora.dateKey);
-    console.log(`[relatorios] Relatorio semanal publicado em ${agora.dateKey}.`);
+    salvarEstadoBot('ultimo_relatorio_diario', agora.dateKey);
+    console.log(`[relatorios] Relatorio diario publicado em ${agora.dateKey}.`);
   }
 }
 
-function iniciarAgendamentoRelatorioSemanal() {
-  if (!CONFIG.canalRelatoriosTicketsId) {
-    console.warn('[relatorios] CANAL_RELATORIOS_TICKETS_ID nao configurado; relatorio semanal automatico desativado.');
+async function verificarRankingDiario() {
+  const agora = dataHoraSaoPaulo();
+  if (agora.hour < RELATORIO_DIARIO_HORA) return;
+  if (lerEstadoBot('ultimo_ranking_diario') === agora.dateKey) return;
+
+  const publicado = await publicarRankingDiario();
+  if (publicado) {
+    salvarEstadoBot('ultimo_ranking_diario', agora.dateKey);
+    console.log(`[rankings] Ranking diario publicado em ${agora.dateKey}.`);
+  }
+}
+
+function iniciarAgendamentoRelatorioDiario() {
+  console.log('[relatorios] Publicacao automatica no canal de relatorios desativada; use o menu fixo para consultas manuais.');
+}
+
+function iniciarAgendamentoRankingDiario() {
+  if (!CONFIG.canalRankingTicketsId) {
+    console.warn('[rankings] CANAL_RANKING_TICKETS_ID nao configurado; ranking diario automatico desativado.');
     return;
   }
 
-  verificarRelatorioSemanal().catch(error => console.error(`[relatorios] Falha no agendamento semanal: ${formatError(error)}`));
+  verificarRankingDiario().catch(error => console.error(`[rankings] Falha no agendamento diario: ${formatError(error)}`));
   setInterval(() => {
-    verificarRelatorioSemanal().catch(error => console.error(`[relatorios] Falha no agendamento semanal: ${formatError(error)}`));
+    verificarRankingDiario().catch(error => console.error(`[rankings] Falha no agendamento diario: ${formatError(error)}`));
   }, 60 * 60 * 1000);
 }
 
@@ -698,8 +1631,13 @@ client.on(Events.ShardResume, (shardId, replayedEvents) => {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Bot online como ${client.user.tag}`);
-  for (const guild of client.guilds.cache.values()) await garantirPainelFixo(guild);
-  iniciarAgendamentoRelatorioSemanal();
+  for (const guild of client.guilds.cache.values()) {
+    await garantirPainelFixo(guild);
+    await garantirPainelComercialFixo(guild);
+  }
+  await garantirGuiaRelatoriosFixo().catch(error => console.error(`[relatorios] Falha ao preparar guia fixo: ${formatError(error)}`));
+  iniciarAgendamentoRelatorioDiario();
+  iniciarAgendamentoRankingDiario();
 });
 
 client.on(Events.InteractionCreate, async interaction => {
@@ -711,53 +1649,122 @@ client.on(Events.InteractionCreate, async interaction => {
         return interaction.reply(ephemeral('Apenas administradores podem consultar relatórios.'));
       }
 
-      return publicarRelatorioTickets(interaction);
+      const destino = CONFIG.canalRelatoriosTicketsId
+        ? `Use o painel fixado em <#${CONFIG.canalRelatoriosTicketsId}> para abrir o menu de relatório.`
+        : 'Use o painel fixado no canal de relatórios para abrir o menu de relatório.';
+      return interaction.reply(ephemeral(destino));
+    }
+
+    if (interaction.isButton() && customId === 'abrir_menu_relatorio') {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+        return interaction.reply(ephemeral('Apenas administradores podem usar o menu de relatórios.'));
+      }
+
+      await interaction.reply({ ...montarPainelRelatorioInterativo(), flags: 64 });
+      agendarLimpezaRespostaRelatorio(interaction);
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && customId.startsWith('painel_relatorio|')) {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+        return interaction.reply(ephemeral('Apenas administradores podem usar o menu de relatórios.'));
+      }
+
+      const estado = parseEstadoRelatorio(customId);
+      if (!estado) return interaction.reply(ephemeral('Estado do menu de relatório inválido.'));
+
+      const proximoEstado = { ...estado };
+      if (estado.acao === 'tipo') proximoEstado.tipo = interaction.values[0];
+      if (estado.acao === 'mes') proximoEstado.mes = Number(interaction.values[0]) || null;
+      if (estado.acao === 'ano') proximoEstado.ano = Number(interaction.values[0]) || null;
+      await interaction.update(montarPainelRelatorioInterativo(proximoEstado));
+      agendarLimpezaRespostaRelatorio(interaction);
+      return;
+    }
+
+    if (interaction.isButton() && customId.startsWith('painel_relatorio|')) {
+      if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+        return interaction.reply(ephemeral('Apenas administradores podem usar o menu de relatórios.'));
+      }
+
+      const estado = parseEstadoRelatorio(customId);
+      if (!estado) return interaction.reply(ephemeral('Estado do menu de relatório inválido.'));
+
+      if (estado.acao === 'limpar') {
+        await interaction.update(montarPainelRelatorioInterativo());
+        agendarLimpezaRespostaRelatorio(interaction);
+        return;
+      }
+
+      if (estado.acao === 'consultar') {
+        const resultado = await publicarRelatorioPorEstado(interaction.guild, estado);
+        if (!resultado.ok) {
+          await interaction.update({
+            ...montarPainelRelatorioInterativo(estado),
+            content: resultado.motivo
+          });
+          agendarLimpezaRespostaRelatorio(interaction);
+          return;
+        }
+
+        await interaction.update({
+          content: 'Consulta concluida. O resultado abaixo aparece apenas para voce.',
+          embeds: [
+            montarResumoPainelRelatorio(estado),
+            resultado.embed
+          ],
+          components: montarPainelRelatorioInterativo(estado).components
+        });
+        agendarLimpezaRespostaRelatorio(interaction);
+        return;
+      }
+    }
+
+    if (interaction.isButton() && customId === 'abrir_ticket_comercial') {
+      if (interaction.channelId !== CONFIG.canalAberturaComercialId) {
+        return interaction.reply(ephemeral(`A abertura comercial só pode ser feita no canal <#${CONFIG.canalAberturaComercialId}>.`));
+      }
+
+      return interaction.showModal(criarModalComercial());
+    }
+
+    if (interaction.isModalSubmit() && customId === 'modal_ticket_comercial') {
+      const canalPermitido = interaction.channelId === CONFIG.canalAberturaId || interaction.channelId === CONFIG.canalAberturaComercialId;
+      if (!canalPermitido) {
+        return interaction.reply(ephemeral(`A abertura comercial só pode ser feita no canal <#${CONFIG.canalAberturaComercialId}>.`));
+      }
+
+      const formulario = lerDadosFormularioComercial(interaction);
+      if (!formulario.ok) {
+        const faltando = formulario.faltando.length ? `\nCampos faltando: ${formulario.faltando.join(', ')}.` : '';
+        return interaction.reply(ephemeral(`Preencha todos os dados e use o motivo "Sem conexão" ou "Conexão lenta".${faltando}`));
+      }
+
+      await interaction.deferReply({ flags: 64 });
+      const resultado = await abrirTicketSetor(interaction, 'suporte', {
+        origemSetorKey: 'comercial',
+        formularioComercial: {
+          ...formulario.dados,
+          motivo: formulario.motivo
+        }
+      });
+
+      if (!resultado.ok) return interaction.editReply({ content: resultado.motivo });
+      await interaction.editReply({ content: `Ticket comercial criado para o suporte: ${resultado.canal}` });
+      setTimeout(() => interaction.deleteReply().catch(() => {}), 10000);
+      return;
     }
 
     if (interaction.isStringSelectMenu() && customId === 'selecionar_setor') {
       if (interaction.channelId !== CONFIG.canalAberturaId)
         return interaction.reply(ephemeral(`A abertura de tickets só pode ser feita no canal <#${CONFIG.canalAberturaId}>.`));
 
-      const setor = CONFIG.setores[interaction.values[0]];
-      if (!setor?.categoriaId || !setor?.cargoId) return interaction.reply(ephemeral('Setor inválido ou configuração incompleta.'));
+      const setorKey = interaction.values[0];
+      if (setorKey === 'comercial') return interaction.showModal(criarModalComercial());
 
-      const categoria = await interaction.guild.channels.fetch(setor.categoriaId).catch(() => null);
-      if (!categoria || categoria.type !== ChannelType.GuildCategory) return interaction.reply(ephemeral('Categoria do setor não encontrada.'));
-
-      const numeroTicket = interaction.guild.channels.cache.filter(c => c.parentId === setor.categoriaId && c.type === ChannelType.GuildText).size + 1;
-      const nomeCanal    = `ticket-${normalize(setor.nome)}-${numeroTicket}`;
-
-      const canalTicket = await interaction.guild.channels.create({
-        name: nomeCanal, type: ChannelType.GuildText, parent: setor.categoriaId,
-        topic: `Ticket de ${interaction.user.tag} | Setor: ${setor.nome}`,
-        permissionOverwrites: [
-          { id: interaction.guild.id,            deny:  [PermissionFlagsBits.ViewChannel] },
-          { id: interaction.user.id,             allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
-          { id: setor.cargoId,                   allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
-          { id: interaction.guild.members.me.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] }
-        ]
-      });
-
-      const cargoObj = await interaction.guild.roles.fetch(setor.cargoId).catch(() => null);
-
-      const dadosTicket = {
-        ticketId: canalTicket.id,
-        setorKey: interaction.values[0],
-        solicitanteId: interaction.user.id, solicitanteTag: interaction.user.tag,
-        setorNome: setor.nome, setorDescricao: setor.descricao,
-        cargoSetorId: setor.cargoId, cargoSetorNome: cargoObj?.name || 'Desconhecido',
-        responsavelId: null, responsavelTag: null, numeroTicket, canalNome: nomeCanal
-      };
-      dadosTickets.set(canalTicket.id, dadosTicket);
-      try {
-        registrarTicketAberto(interaction, dadosTicket);
-      } catch (error) {
-        console.error(`[relatorios] Falha ao registrar ticket aberto: ${formatError(error)}`);
-      }
-
-      await canalTicket.send({ content: `<@&${setor.cargoId}> novo ticket aberto por ${interaction.user}.` });
-      await canalTicket.send({ content: montarMensagemTicket(canalTicket.id), components: [criarBotoesTicket(canalTicket.id)] });
-      await interaction.reply(ephemeral(`Seu ticket foi criado com sucesso: ${canalTicket}`));
+      const resultado = await abrirTicketSetor(interaction, setorKey);
+      if (!resultado.ok) return interaction.reply(ephemeral(resultado.motivo));
+      await interaction.reply(ephemeral(`Seu ticket foi criado com sucesso: ${resultado.canal}`));
       setTimeout(() => interaction.deleteReply().catch(() => {}), 10000);
       return;
     }
@@ -780,7 +1787,7 @@ client.on(Events.InteractionCreate, async interaction => {
         console.error(`[relatorios] Falha ao registrar ticket assumido: ${formatError(error)}`);
       }
       await interaction.channel.setName(`${normalize(interaction.user.username)}-${normalize(dados.setorNome)}-${dados.numeroTicket}`.slice(0, 90)).catch(() => {});
-      return interaction.update({ content: montarMensagemTicket(ticketId), components: [criarBotoesTicket(ticketId)] });
+      return interaction.update({ ...montarMensagemTicket(ticketId), components: [criarBotoesTicket(ticketId)] });
     }
 
     if (interaction.isButton() && customId.startsWith('adicionar_ticket_')) {
@@ -837,61 +1844,8 @@ client.on(Events.InteractionCreate, async interaction => {
         const mensagens = await coletarMensagens(interaction.channel);
         if (!dados.canalNome) dados.canalNome = interaction.channel.name;
 
-        const rCargo = criarResolver(interaction.guild, async (g, id) => { const r = await g.roles.fetch(id).catch(() => null);    return r?.name || id; });
-        const rUser  = criarResolver(interaction.guild, async (g, id) => { const m = await g.members.fetch(id).catch(() => null);  return m?.displayName || m?.user?.username || id; });
-        const rCanal = criarResolver(interaction.guild, async (g, id) => { const c = await g.channels.fetch(id).catch(() => null); return c?.name || id; });
-
-        for (const msg of mensagens) {
-          const t = msg.content || '';
-          for (const m of t.matchAll(/<@&(\d+)>/g))  await rCargo(m[1]);
-          for (const m of t.matchAll(/<@!?(\d+)>/g)) await rUser(m[1]);
-          for (const m of t.matchAll(/<#(\d+)>/g))   await rCanal(m[1]);
-        }
-
-        const b64 = new Map();
-        for (const msg of mensagens)
-          for (const [, a] of msg.attachments) {
-            const r = await baixarAnexo(a);
-            if (r) b64.set(a.id, r);
-          }
-
-        const agora    = new Date();
-        const dataStr  = agora.toLocaleDateString('pt-BR').replace(/\//g, '-');
-        const userNorm = normalize(dados.solicitanteTag.split('#')[0]);
-        const nomeArq  = `transcript-${userNorm}-${dataStr}.html`;
-
-        const buffer = Buffer.from(gerarTranscriptHtml(dados, mensagens, interaction.user.tag, rCargo.sync, rUser.sync, rCanal.sync, b64), 'utf-8');
-        const payloadDmSolicitante = {
-          content: `📄 Transcript do ticket **${dados.canalNome}**.\nAbra o **.html** no navegador.`,
-          files: [new AttachmentBuilder(buffer, { name: nomeArq })]
-        };
-        await enviarTranscriptPorDm(dados.solicitanteId, payloadDmSolicitante);
-
-        if (dados.responsavelId && dados.responsavelId !== dados.solicitanteId) {
-          await enviarTranscriptPorDm(dados.responsavelId, {
-            content: `📄 Transcript do ticket **${dados.canalNome}** que você assumiu.\nSolicitante: **${dados.solicitanteTag}**.\nAbra o **.html** no navegador.`,
-            files: [new AttachmentBuilder(buffer, { name: nomeArq })]
-          });
-        }
-
-        const canalLogs = await interaction.guild.channels.fetch(CONFIG.canalLogsTicketsId).catch(() => null);
-        if (canalLogs?.isTextBased())
-          await canalLogs.send({ content: `🔒 **Ticket fechado**\n👤 <@${dados.solicitanteId}>\n🗂️ ${dados.setorNome}\n🔒 Fechado por <@${interaction.user.id}>`, files: [new AttachmentBuilder(buffer, { name: nomeArq })] }).catch(e => console.error(e));
-
-        const canalFechadosSetorId = dados.setorKey ? CONFIG.setores[dados.setorKey]?.canalFechadosId : null;
-        const canalFechadosSetor = canalFechadosSetorId
-          ? await interaction.guild.channels.fetch(canalFechadosSetorId).catch(() => null)
-          : null;
-
-        if (canalFechadosSetor?.isTextBased()) {
-          const responsavelLinha = dados.responsavelId
-            ? `👨‍💼 Assumido por <@${dados.responsavelId}>`
-            : '👨‍💼 Ticket não foi assumido';
-          await canalFechadosSetor.send({
-            content: `📁 **Ticket fechado no setor ${dados.setorNome}**\n👤 Aberto por <@${dados.solicitanteId}>\n${responsavelLinha}\n🔒 Fechado por <@${interaction.user.id}>`,
-            files: [new AttachmentBuilder(buffer, { name: nomeArq })]
-          }).catch(e => console.error(e));
-        }
+        const transcript = await prepararTranscriptTicket(interaction, dados, mensagens);
+        await enviarTranscriptTicket(interaction, dados, transcript);
 
         dadosTickets.delete(ticketId);
         setTimeout(() => interaction.channel?.delete('Ticket fechado com transcript.'), 3000);
@@ -918,6 +1872,14 @@ process.on('uncaughtException', error => {
 });
 
 async function iniciarBot() {
+  if (TRANSCRIPT_BASE_URL && !TRANSCRIPT_HTTP_PORT) {
+    console.log('[transcript] TRANSCRIPT_BASE_URL configurada sem TRANSCRIPT_HTTP_PORT; assumindo que outro servidor vai publicar os arquivos dessa pasta.');
+  }
+  if (TRANSCRIPT_HTTP_PORT && !TRANSCRIPT_BASE_URL) {
+    console.warn('[transcript] TRANSCRIPT_HTTP_PORT configurada sem TRANSCRIPT_BASE_URL; os arquivos serao servidos, mas o bot continuara enviando anexo por nao ter URL publica para montar.');
+  }
+  iniciarServidorTranscripts();
+
   const connectionCheck = await diagnoseDiscordConnection();
 
   if (!connectionCheck.ok) {
