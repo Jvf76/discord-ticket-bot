@@ -5,6 +5,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { readEnv, requireEnv } = require('./env');
+const { criarChamadoFlowIsp, flowIspConfigurado } = require('./flowisp');
+const { criarMenuSetoresChamadoTi, criarModalChamadoTi } = require('./chamado-ti-ui');
 const {
   diagnoseDiscordConnection,
   formatError,
@@ -74,6 +76,11 @@ const CONFIG = {
     agendamento: { nome: '📅 Agendamento', descricao: 'Marcação de visitas técnicas, instalações, ativações e remanejamentos.',              categoriaId: env.CATEGORIA_AGENDAMENTO_ID, cargoId: env.CARGO_AGENDAMENTO_ID, canalFechadosId: readEnv('CANAL_FECHADOS_AGENDAMENTO_ID') },
     comercial:   { nome: '💰 Comercial',   descricao: 'Solicitações sobre vendas, propostas, planos, contratos e relacionamento comercial.', categoriaId: env.CATEGORIA_COMERCIAL_ID,   cargoId: env.CARGO_COMERCIAL_ID,   canalFechadosId: readEnv('CANAL_FECHADOS_COMERCIAL_ID') }
   }
+};
+
+const DESTINOS_CHAMADO_TI = {
+  sistemas: { label: 'SISTEMA (CHRISTIAN E DIEISSON)', teamName: 'SISTEMAS' },
+  noc: { label: 'N.O.C / TI', teamName: 'N.O.C' }
 };
 
 const normalize = t => t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
@@ -210,6 +217,7 @@ function iniciarBanco() {
     CREATE INDEX IF NOT EXISTS idx_ticket_events_type ON ticket_events(event_type);
     CREATE INDEX IF NOT EXISTS idx_ticket_events_user ON ticket_events(user_id);
     CREATE INDEX IF NOT EXISTS idx_ticket_events_setor ON ticket_events(setor_key);
+    CREATE INDEX IF NOT EXISTS idx_ticket_events_created_at ON ticket_events(created_at);
 
     CREATE TABLE IF NOT EXISTS bot_state (
       key TEXT PRIMARY KEY,
@@ -1006,16 +1014,6 @@ async function enviarTranscriptHtml(destino, payload) {
   return Boolean(mensagem);
 }
 
-function criarMenuSetores({ incluirComercial = true } = {}) {
-  const setores = Object.entries(CONFIG.setores)
-    .filter(([value]) => incluirComercial || value !== 'comercial');
-
-  return new StringSelectMenuBuilder()
-    .setCustomId('selecionar_setor')
-    .setPlaceholder('Selecione o setor para abrir o ticket')
-    .addOptions(setores.map(([value, { nome, descricao }]) => ({ label: nome, description: descricao.slice(0, 100), value })));
-}
-
 function montarPainelTicketsComercial() {
   return {
     content: [
@@ -1222,10 +1220,29 @@ async function garantirPainelFixo(guild) {
   if (!canal || canal.type !== ChannelType.GuildText) return;
   const msgs = await canal.messages.fetch({ limit: 20 }).catch(() => null);
   if (!msgs) return;
-  const existente = msgs.find(m => m.author.id === client.user.id && m.components?.[0]?.components?.[0]?.data?.custom_id === 'selecionar_setor');
+  const existente = msgs.find(m =>
+    m.author.id === client.user.id &&
+    m.components?.some(actionRow =>
+      actionRow.components?.some(component =>
+        component.data?.custom_id === 'selecionar_setor' ||
+        component.data?.custom_id?.startsWith('abrir_chamado_ti')
+      )
+    )
+  );
   const payload   = {
-    content: `# 🎫 Central de Tickets\n\nSelecione abaixo o setor responsável pelo seu atendimento.`,
-    components: [row(criarMenuSetores({ incluirComercial: !CONFIG.canalAberturaComercialId }))]
+    content: `# Central de Chamado\n\nEscolha a equipe responsável. Depois informe seu setor, descreva o problema e anexe imagens ou prints, se necessário.`,
+    components: [
+      row(
+        new ButtonBuilder()
+          .setCustomId('abrir_chamado_ti|noc')
+          .setLabel(DESTINOS_CHAMADO_TI.noc.label)
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId('abrir_chamado_ti|sistemas')
+          .setLabel(DESTINOS_CHAMADO_TI.sistemas.label)
+          .setStyle(ButtonStyle.Primary)
+      )
+    ]
   };
   existente ? await existente.edit(payload).catch(() => {}) : await canal.send(payload).catch(() => {});
 }
@@ -1660,7 +1677,8 @@ client.on(Events.InteractionCreate, async interaction => {
         return interaction.reply(ephemeral('Apenas administradores podem usar o menu de relatórios.'));
       }
 
-      await interaction.reply({ ...montarPainelRelatorioInterativo(), flags: 64 });
+      await interaction.deferReply({ flags: 64 });
+      await interaction.editReply(montarPainelRelatorioInterativo());
       agendarLimpezaRespostaRelatorio(interaction);
       return;
     }
@@ -1673,11 +1691,12 @@ client.on(Events.InteractionCreate, async interaction => {
       const estado = parseEstadoRelatorio(customId);
       if (!estado) return interaction.reply(ephemeral('Estado do menu de relatório inválido.'));
 
+      await interaction.deferUpdate();
       const proximoEstado = { ...estado };
       if (estado.acao === 'tipo') proximoEstado.tipo = interaction.values[0];
       if (estado.acao === 'mes') proximoEstado.mes = Number(interaction.values[0]) || null;
       if (estado.acao === 'ano') proximoEstado.ano = Number(interaction.values[0]) || null;
-      await interaction.update(montarPainelRelatorioInterativo(proximoEstado));
+      await interaction.editReply(montarPainelRelatorioInterativo(proximoEstado));
       agendarLimpezaRespostaRelatorio(interaction);
       return;
     }
@@ -1690,8 +1709,9 @@ client.on(Events.InteractionCreate, async interaction => {
       const estado = parseEstadoRelatorio(customId);
       if (!estado) return interaction.reply(ephemeral('Estado do menu de relatório inválido.'));
 
+      await interaction.deferUpdate();
       if (estado.acao === 'limpar') {
-        await interaction.update(montarPainelRelatorioInterativo());
+        await interaction.editReply(montarPainelRelatorioInterativo());
         agendarLimpezaRespostaRelatorio(interaction);
         return;
       }
@@ -1699,7 +1719,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (estado.acao === 'consultar') {
         const resultado = await publicarRelatorioPorEstado(interaction.guild, estado);
         if (!resultado.ok) {
-          await interaction.update({
+          await interaction.editReply({
             ...montarPainelRelatorioInterativo(estado),
             content: resultado.motivo
           });
@@ -1707,7 +1727,7 @@ client.on(Events.InteractionCreate, async interaction => {
           return;
         }
 
-        await interaction.update({
+        await interaction.editReply({
           content: 'Consulta concluida. O resultado abaixo aparece apenas para voce.',
           embeds: [
             montarResumoPainelRelatorio(estado),
@@ -1720,6 +1740,69 @@ client.on(Events.InteractionCreate, async interaction => {
       }
     }
 
+    if (interaction.isButton() && customId.startsWith('abrir_chamado_ti')) {
+      if (interaction.channelId !== CONFIG.canalAberturaId) {
+        return interaction.reply(ephemeral(`A abertura de chamados de TI só pode ser feita no canal <#${CONFIG.canalAberturaId}>.`));
+      }
+      const destination = customId.split('|')[1] || 'noc';
+      const destinationConfig = DESTINOS_CHAMADO_TI[destination];
+      if (!destinationConfig) {
+        return interaction.reply(ephemeral('Destino de chamado inválido. Atualize o painel e tente novamente.'));
+      }
+      if (!flowIspConfigurado()) {
+        return interaction.reply(ephemeral('A integração com o FlowISP ainda não está configurada. Avise o N.O.C.'));
+      }
+      return interaction.reply({
+        content: `Equipe selecionada: **${destinationConfig.teamName}**\nQual é o seu setor?`,
+        components: [row(criarMenuSetoresChamadoTi(CONFIG.setores, destination))],
+        flags: 64
+      });
+    }
+
+    if (interaction.isStringSelectMenu() && customId.startsWith('selecionar_setor_chamado_ti|')) {
+      const destination = customId.split('|')[1];
+      const setorKey = interaction.values[0];
+      if (!DESTINOS_CHAMADO_TI[destination] || !CONFIG.setores[setorKey]) {
+        return interaction.reply(ephemeral('Setor inválido. Tente novamente.'));
+      }
+      return interaction.showModal(criarModalChamadoTi(setorKey, destination));
+    }
+
+    if (interaction.isModalSubmit() && customId.startsWith('modal_chamado_ti|')) {
+      const [, destination, setorKey] = customId.split('|');
+      const destinationConfig = DESTINOS_CHAMADO_TI[destination];
+      const setor = CONFIG.setores[setorKey];
+      if (!destinationConfig || !setor) return interaction.reply(ephemeral('Destino ou setor inválido. Tente novamente.'));
+
+      const problem = interaction.fields.getTextInputValue('problema_ti').trim();
+      const attachments = interaction.fields.getUploadedFiles('imagens_ti') || [];
+      await interaction.deferReply({ flags: 64 });
+
+      try {
+        const result = await criarChamadoFlowIsp({
+          externalId: interaction.id,
+          requesterDiscordId: interaction.user.id,
+          requesterName: interaction.member?.displayName || interaction.user.globalName || interaction.user.username,
+          sector: setor.nome.replace(/^[^\p{L}\p{N}]+/u, '').trim(),
+          problem,
+          discordChannelId: interaction.channelId,
+          discordGuildId: interaction.guildId,
+          destination,
+          attachments
+        });
+        const code = result.task?.id ? `#${result.task.id.slice(0, 8)}` : 'indisponivel';
+        const message = result.created === false
+          ? `Este chamado já estava registrado no FlowISP.\n**ID do ticket:** ${code}\n**Equipe:** ${destinationConfig.teamName}\n\nO chamado será analisado e resolvido pela equipe responsável.`
+          : `Chamado aberto com sucesso.\n**ID do ticket:** ${code}\n**Equipe:** ${destinationConfig.teamName}\n\nO chamado será analisado e resolvido pela equipe responsável.`;
+        return interaction.editReply({ content: message });
+      } catch (error) {
+        console.error(`[flowisp] Falha ao criar chamado: ${formatError(error)}`);
+        return interaction.editReply({
+          content: `Não foi possível criar o chamado no FlowISP: ${error.message || 'erro inesperado'}. Tente novamente ou avise o N.O.C.`
+        });
+      }
+    }
+
     if (interaction.isButton() && customId === 'abrir_ticket_comercial') {
       if (interaction.channelId !== CONFIG.canalAberturaComercialId) {
         return interaction.reply(ephemeral(`A abertura comercial só pode ser feita no canal <#${CONFIG.canalAberturaComercialId}>.`));
@@ -1729,8 +1812,7 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 
     if (interaction.isModalSubmit() && customId === 'modal_ticket_comercial') {
-      const canalPermitido = interaction.channelId === CONFIG.canalAberturaId || interaction.channelId === CONFIG.canalAberturaComercialId;
-      if (!canalPermitido) {
+      if (interaction.channelId !== CONFIG.canalAberturaComercialId) {
         return interaction.reply(ephemeral(`A abertura comercial só pode ser feita no canal <#${CONFIG.canalAberturaComercialId}>.`));
       }
 
@@ -1751,20 +1833,6 @@ client.on(Events.InteractionCreate, async interaction => {
 
       if (!resultado.ok) return interaction.editReply({ content: resultado.motivo });
       await interaction.editReply({ content: `Ticket comercial criado para o suporte: ${resultado.canal}` });
-      setTimeout(() => interaction.deleteReply().catch(() => {}), 10000);
-      return;
-    }
-
-    if (interaction.isStringSelectMenu() && customId === 'selecionar_setor') {
-      if (interaction.channelId !== CONFIG.canalAberturaId)
-        return interaction.reply(ephemeral(`A abertura de tickets só pode ser feita no canal <#${CONFIG.canalAberturaId}>.`));
-
-      const setorKey = interaction.values[0];
-      if (setorKey === 'comercial') return interaction.showModal(criarModalComercial());
-
-      const resultado = await abrirTicketSetor(interaction, setorKey);
-      if (!resultado.ok) return interaction.reply(ephemeral(resultado.motivo));
-      await interaction.reply(ephemeral(`Seu ticket foi criado com sucesso: ${resultado.canal}`));
       setTimeout(() => interaction.deleteReply().catch(() => {}), 10000);
       return;
     }
