@@ -5,7 +5,13 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { readEnv, requireEnv } = require('./env');
-const { criarChamadoFlowIsp, flowIspConfigurado } = require('./flowisp');
+const {
+  confirmarConclusaoFlowIsp,
+  criarChamadoFlowIsp,
+  flowIspConfigurado,
+  reivindicarConclusaoFlowIsp
+} = require('./flowisp');
+const { processarConclusoesFlowIsp } = require('./flowisp-completion');
 const { criarMenuSetoresChamadoTi, criarModalChamadoTi } = require('./chamado-ti-ui');
 const {
   diagnoseDiscordConnection,
@@ -1629,6 +1635,45 @@ function iniciarAgendamentoRankingDiario() {
   }, 60 * 60 * 1000);
 }
 
+let verificacaoConclusoesEmAndamento = false;
+
+async function verificarConclusoesFlowIsp() {
+  if (verificacaoConclusoesEmAndamento || !flowIspConfigurado()) return;
+  verificacaoConclusoesEmAndamento = true;
+  try {
+    const delivered = await processarConclusoesFlowIsp({
+      client,
+      reivindicar: reivindicarConclusaoFlowIsp,
+      confirmar: confirmarConclusaoFlowIsp,
+      onError: (error, completion) => {
+        console.error(
+          `[flowisp] Falha ao avisar conclusão do ticket ${completion?.ticketCode || 'desconhecido'}: ${formatError(error)}`
+        );
+      }
+    });
+    if (delivered > 0) {
+      console.log(`[flowisp] ${delivered} notificação(ões) de conclusão enviada(s) no privado.`);
+    }
+  } finally {
+    verificacaoConclusoesEmAndamento = false;
+  }
+}
+
+function iniciarNotificacoesConclusaoFlowIsp() {
+  if (!flowIspConfigurado()) {
+    console.warn('[flowisp] Integração não configurada; avisos de conclusão desativados.');
+    return;
+  }
+  verificarConclusoesFlowIsp().catch(error => {
+    console.error(`[flowisp] Falha ao consultar conclusões: ${formatError(error)}`);
+  });
+  setInterval(() => {
+    verificarConclusoesFlowIsp().catch(error => {
+      console.error(`[flowisp] Falha ao consultar conclusões: ${formatError(error)}`);
+    });
+  }, 30_000);
+}
+
 function logDiscordError(event, error) {
   console.error(`[discord:${event}] ${formatError(error)}`);
 }
@@ -1655,6 +1700,7 @@ client.once(Events.ClientReady, async () => {
   await garantirGuiaRelatoriosFixo().catch(error => console.error(`[relatorios] Falha ao preparar guia fixo: ${formatError(error)}`));
   iniciarAgendamentoRelatorioDiario();
   iniciarAgendamentoRankingDiario();
+  iniciarNotificacoesConclusaoFlowIsp();
 });
 
 client.on(Events.InteractionCreate, async interaction => {

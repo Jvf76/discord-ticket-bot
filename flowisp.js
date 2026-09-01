@@ -149,8 +149,57 @@ async function criarChamadoFlowIsp(data) {
   return body;
 }
 
+async function requisicaoFlowIspJson(path, options = {}) {
+  const { baseUrl, integrationKey } = configuracao();
+  const response = await fetchComTimeout(`${baseUrl}${path}`, {
+    method: options.method || 'POST',
+    headers: {
+      'x-flowisp-integration-key': integrationKey,
+      'content-type': 'application/json',
+      ...(options.headers || {})
+    },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body)
+  }, options.timeoutMs || 15_000);
+
+  const text = await response.text();
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    body = {};
+  }
+  if (!response.ok) {
+    const message = Array.isArray(body.message)
+      ? body.message.join('; ')
+      : body.message;
+    throw new FlowIspError(
+      message || 'O FlowISP recusou a consulta de conclusões.',
+      response.status
+    );
+  }
+  return body;
+}
+
+async function reivindicarConclusaoFlowIsp() {
+  const body = await requisicaoFlowIspJson(
+    '/integrations/discord/tickets/completions/claim'
+  );
+  return body.completion || null;
+}
+
+async function confirmarConclusaoFlowIsp(referenceId) {
+  if (!referenceId) {
+    throw new FlowIspError('Identificador da conclusão não informado.');
+  }
+  return requisicaoFlowIspJson(
+    `/integrations/discord/tickets/completions/${encodeURIComponent(referenceId)}/ack`
+  );
+}
+
 module.exports = {
   FlowIspError,
+  confirmarConclusaoFlowIsp,
   criarChamadoFlowIsp,
-  flowIspConfigurado
+  flowIspConfigurado,
+  reivindicarConclusaoFlowIsp
 };
