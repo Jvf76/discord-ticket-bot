@@ -80,7 +80,8 @@ const CONFIG = {
     cobranca:    { nome: '💸 Cobrança',    descricao: 'Pendências financeiras, negociação, inadimplência e retorno de cobrança.',            categoriaId: env.CATEGORIA_COBRANCA_ID,    cargoId: env.CARGO_COBRANCA_ID,    canalFechadosId: readEnv('CANAL_FECHADOS_COBRANCA_ID') },
     suporte:     { nome: '🎧 Suporte',     descricao: 'Problemas técnicos, falhas de acesso, equipamentos e atendimento operacional.',        categoriaId: env.CATEGORIA_SUPORTE_ID,     cargoId: env.CARGO_SUPORTE_ID,     canalFechadosId: readEnv('CANAL_FECHADOS_SUPORTE_ID') },
     agendamento: { nome: '📅 Agendamento', descricao: 'Marcação de visitas técnicas, instalações, ativações e remanejamentos.',              categoriaId: env.CATEGORIA_AGENDAMENTO_ID, cargoId: env.CARGO_AGENDAMENTO_ID, canalFechadosId: readEnv('CANAL_FECHADOS_AGENDAMENTO_ID') },
-    comercial:   { nome: '💰 Comercial',   descricao: 'Solicitações sobre vendas, propostas, planos, contratos e relacionamento comercial.', categoriaId: env.CATEGORIA_COMERCIAL_ID,   cargoId: env.CARGO_COMERCIAL_ID,   canalFechadosId: readEnv('CANAL_FECHADOS_COMERCIAL_ID') }
+    comercial:   { nome: '💰 Comercial',   descricao: 'Solicitações sobre vendas, propostas, planos, contratos e relacionamento comercial.', categoriaId: env.CATEGORIA_COMERCIAL_ID,   cargoId: env.CARGO_COMERCIAL_ID,   canalFechadosId: readEnv('CANAL_FECHADOS_COMERCIAL_ID') },
+    auditoria:   { nome: '📋 Auditoria',   descricao: 'Solicitações relacionadas a auditorias, conferências e processos de controle.',       categoriaId: readEnv('CATEGORIA_AUDITORIA_ID'), cargoId: readEnv('CARGO_AUDITORIA_ID'), canalFechadosId: readEnv('CANAL_FECHADOS_AUDITORIA_ID') }
   }
 };
 

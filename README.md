@@ -6,7 +6,7 @@ Bot de sistema de tickets para Discord com transcript automático em HTML, geren
 
 ## 🚀 Funcionalidades
 
-- **📩 Criação de tickets por setor** — painel com menu de seleção para RH, Financeiro, NOC, Estoque, Cobrança, Suporte, Agendamento e Comercial
+- **📩 Criação de tickets por setor** — painel com menu de seleção para RH, Financeiro, NOC, Estoque, Cobrança, Suporte, Agendamento, Comercial e Auditoria
 - **🏪 Abertura comercial separada** — canal proprio para o comercial abrir ticket ao suporte com ID do cliente, relato, atendente, telefone e motivo obrigatório
 - **🔒 Canais privados** — cada ticket abre um canal exclusivo visível apenas ao solicitante e ao setor responsável
 - **🤝 Assumir ticket** — membros do setor podem assumir o atendimento, registrando o responsável
@@ -90,6 +90,7 @@ CANAL_FECHADOS_COBRANCA_ID=
 CANAL_FECHADOS_SUPORTE_ID=
 CANAL_FECHADOS_AGENDAMENTO_ID=
 CANAL_FECHADOS_COMERCIAL_ID=
+CANAL_FECHADOS_AUDITORIA_ID=
 
 # Categorias de cada setor
 CATEGORIA_RH_ID=
@@ -100,6 +101,7 @@ CATEGORIA_COBRANCA_ID=
 CATEGORIA_SUPORTE_ID=
 CATEGORIA_AGENDAMENTO_ID=
 CATEGORIA_COMERCIAL_ID=
+CATEGORIA_AUDITORIA_ID=
 
 # Cargos responsáveis por cada setor
 CARGO_RH_ID=
@@ -110,6 +112,7 @@ CARGO_COBRANCA_ID=
 CARGO_SUPORTE_ID=
 CARGO_AGENDAMENTO_ID=
 CARGO_COMERCIAL_ID=
+CARGO_AUDITORIA_ID=
 ```
 
 ---
